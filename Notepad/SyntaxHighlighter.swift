@@ -1,0 +1,303 @@
+import AppKit
+
+// MARK: - Language
+
+enum Language {
+    case json, xml, html, markdown, csv, tsv, plain
+
+    static func detect(from url: URL?) -> Language {
+        switch url?.pathExtension.lowercased() {
+        case "json": return .json
+        case "xml":  return .xml
+        case "html", "htm": return .html
+        case "md", "markdown": return .markdown
+        case "csv": return .csv
+        case "tsv", "tab": return .tsv
+        default: return .plain
+        }
+    }
+
+    var canPrettyPrint: Bool {
+        switch self { case .json, .xml, .html: return true; default: return false }
+    }
+
+    var isTabular: Bool {
+        switch self { case .csv, .tsv: return true; default: return false }
+    }
+
+    /// Delimiter character for CSV/TSV; nil for all other languages.
+    var tabularDelimiter: Character? {
+        switch self {
+        case .csv: return ","
+        case .tsv: return "\t"
+        default:   return nil
+        }
+    }
+}
+
+// MARK: - CSV Row Model
+
+/// One row of a parsed delimited file. UUID identity is intentional:
+/// future cell editing / row insertion tracks by id, not index position.
+struct CSVRow: Identifiable {
+    let id   = UUID()
+    var cells: [String]
+}
+
+// MARK: - Delimited File Parsing & Serialization
+
+/// RFC 4180-compliant parser. Strips quotes for display; never touches document.text.
+func parseDelimited(_ text: String, delimiter: Character) -> [CSVRow] {
+    var result:   [CSVRow]  = []
+    var row:      [String]  = []
+    var field     = ""
+    var inQuotes  = false
+    var i         = text.startIndex
+
+    while i < text.endIndex {
+        let c    = text[i]
+        let next = text.index(after: i)
+
+        if inQuotes {
+            if c == "\"" {
+                if next < text.endIndex && text[next] == "\"" {
+                    field.append("\""); i = next          // escaped ""
+                } else {
+                    inQuotes = false
+                }
+            } else { field.append(c) }
+        } else {
+            if      c == "\"" { inQuotes = true }
+            else if c == delimiter { row.append(field); field = "" }
+            else if c == "\r\n" || c == "\n" || c == "\r" {
+                // Swift treats \r\n as ONE Character (a single grapheme cluster),
+                // so we must match it explicitly — c == "\r" alone will never fire
+                // for CRLF files, causing the entire file to parse as one row.
+                row.append(field); field = ""
+                result.append(CSVRow(cells: row)); row = []
+            } else { field.append(c) }
+        }
+        i = text.index(after: i)
+    }
+    // Flush last row (no trailing newline)
+    row.append(field)
+    if !row.allSatisfy({ $0.isEmpty }) { result.append(CSVRow(cells: row)) }
+    return result
+}
+
+/// Re-serializes rows to proper CSV/TSV for clipboard. Quotes fields that need it.
+/// Only used for copy; document.text is never modified.
+func serializeDelimited(_ rows: [CSVRow], delimiter: Character) -> String {
+    rows.map { row in
+        row.cells.map { field in
+            let needs = field.contains(delimiter) || field.contains("\"")
+                     || field.contains("\n")      || field.contains("\r")
+            if needs { return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
+            return field
+        }.joined(separator: String(delimiter))
+    }.joined(separator: "\n")
+}
+
+/// Scans the first 20 lines and returns comma or tab — whichever appears more.
+func autoDetectDelimiter(in text: String) -> Character {
+    let sample = text.components(separatedBy: .newlines).prefix(20)
+    var commas = 0; var tabs = 0
+    for line in sample {
+        commas += line.filter { $0 == "," }.count
+        tabs   += line.filter { $0 == "\t" }.count
+    }
+    return tabs > commas ? "\t" : ","
+}
+
+// MARK: - Pretty Printer / Minifier
+
+func prettyPrint(text: String, language: Language) -> String? {
+    switch language {
+    case .json:
+        guard let data  = text.data(using: .utf8),
+              let obj   = try? JSONSerialization.jsonObject(with: data),
+              let pretty = try? JSONSerialization.data(withJSONObject: obj,
+                                                       options: [.prettyPrinted, .sortedKeys]),
+              let result = String(data: pretty, encoding: .utf8)
+        else { return nil }
+        return result
+    case .xml:
+        return prettyPrintXML(text)
+    case .html:
+        return prettyPrintHTML(text)
+    default:
+        return nil
+    }
+}
+
+func minify(text: String, language: Language) -> String? {
+    switch language {
+    case .json:
+        guard let data    = text.data(using: .utf8),
+              let obj     = try? JSONSerialization.jsonObject(with: data),
+              let compact = try? JSONSerialization.data(withJSONObject: obj, options: []),
+              let result  = String(data: compact, encoding: .utf8)
+        else { return nil }
+        return result
+    case .xml:
+        return minifyXML(text)
+    case .html:
+        return minifyHTML(text)
+    default:
+        return nil
+    }
+}
+
+// Strict XML pretty print
+private func prettyPrintXML(_ src: String) -> String? {
+    guard let data = src.data(using: .utf8),
+          let doc  = try? XMLDocument(data: data, options: [.nodePreserveWhitespace])
+    else { return nil }
+    return doc.xmlString(options: [.nodePrettyPrint])
+}
+
+// HTML pretty print — uses libxml2's lenient HTML parser so real-world HTML works
+private func prettyPrintHTML(_ src: String) -> String? {
+    guard let data = src.data(using: .utf8),
+          let doc  = try? XMLDocument(data: data, options: [.documentTidyHTML])
+    else { return nil }
+    return doc.xmlString(options: [.nodePrettyPrint])
+}
+
+private func minifyXML(_ src: String) -> String? {
+    guard let data = src.data(using: .utf8),
+          let doc  = try? XMLDocument(data: data, options: [])
+    else { return nil }
+    return doc.xmlString(options: [])
+}
+
+private func minifyHTML(_ src: String) -> String? {
+    guard let data = src.data(using: .utf8),
+          let doc  = try? XMLDocument(data: data, options: [.documentTidyHTML])
+    else { return nil }
+    return doc.xmlString(options: [])
+}
+
+// MARK: - Syntax Highlighter
+
+final class SyntaxHighlighter: NSObject, NSTextStorageDelegate {
+    var language: Language = .plain
+    /// The base ink color for the current paper theme. Set this whenever the
+    /// theme changes so plain text and non-token regions always render correctly
+    /// in dark / sepia / light mode rather than falling back to system black.
+    var inkColor: NSColor = .labelColor
+    private var isHighlighting = false
+
+    func textStorage(
+        _ textStorage: NSTextStorage,
+        willProcessEditing editedMask: NSTextStorageEditActions,
+        range editedRange: NSRange,
+        changeInLength delta: Int
+    ) {
+        guard !isHighlighting,
+              editedMask.contains(.editedCharacters)
+        else { return }
+
+        isHighlighting = true
+        let full = NSRange(location: 0, length: textStorage.length)
+
+        if language == .plain {
+            // For plain text, only paint the edited range — NOT the full document.
+            //
+            // Painting the full range inside willProcessEditing corrupts
+            // NSTextInputContext's internal replacement-range tracking: on the
+            // very next keystroke it uses that full range as the insertion's
+            // replacementRange, replacing the entire document instead of
+            // inserting at the cursor position.
+            //
+            // The edited range IS the full range for initial load and for the
+            // programmatic ts.edited(…range: full…) we fire on theme changes,
+            // so those paths are still fully colored.
+            textStorage.addAttribute(.foregroundColor, value: inkColor, range: editedRange)
+            isHighlighting = false
+            return
+        }
+
+        // Syntax-highlighted languages: paint everything first (needed to clear
+        // stale token colors when the language switches), then apply tokens.
+        textStorage.addAttribute(.foregroundColor, value: inkColor, range: full)
+        switch language {
+        case .json: applyJSON(textStorage)
+        case .xml, .html: applyXML(textStorage)
+        case .markdown: applyMarkdown(textStorage)
+        default: break
+        }
+        isHighlighting = false
+    }
+
+    // MARK: JSON
+
+    private func applyJSON(_ ts: NSTextStorage) {
+        let str = ts.string
+        let patterns: [(String, NSColor)] = [
+            (#""([^"\\]|\\.)*"\s*(?=:)"#, .systemBlue),       // keys
+            (#"(?<=:\s)"([^"\\]|\\.)*""#, .systemOrange),      // string values
+            (#"\b-?\d+(\.\d+)?([eE][+-]?\d+)?\b"#, .systemPurple), // numbers
+            (#"\b(true|false|null)\b"#, .systemRed),            // keywords
+        ]
+        applyPatterns(patterns, to: ts, in: str)
+    }
+
+    // MARK: XML/HTML
+
+    private func applyXML(_ ts: NSTextStorage) {
+        let str = ts.string
+        let patterns: [(String, NSColor)] = [
+            (#"<!--[\s\S]*?-->"#, .systemGreen),                // comments
+            (#"<[/!?]?[a-zA-Z][^>]*>"#, .systemBlue),          // tags
+            (#"\b[a-zA-Z][\w-]*(?=\s*=)"#, .systemPurple),     // attributes
+            (#"(?<==)"[^"]*""#, .systemOrange),                 // attr values
+        ]
+        applyPatterns(patterns, to: ts, in: str)
+    }
+
+    // MARK: Markdown
+
+    private func applyMarkdown(_ ts: NSTextStorage) {
+        let str = ts.string
+        let patterns: [(String, NSColor)] = [
+            (#"^#{1,6}\s.+$"#, .systemBlue),                   // headers
+            (#"`[^`]+`"#, .systemOrange),                       // inline code
+            (#"\[([^\]]+)\]\([^)]+\)"#, .systemTeal),           // links
+            (#"\*\*[^*]+\*\*|__[^_]+__"#, .labelColor),        // bold (keep default, will bold)
+        ]
+        applyPatterns(patterns, to: ts, in: str)
+
+        // Bold
+        apply(pattern: #"\*\*[^*]+\*\*|__[^_]+__"#, to: ts, in: str) { range in
+            ts.addAttribute(.font,
+                value: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
+                range: range)
+        }
+    }
+
+    // MARK: Helpers
+
+    private func applyPatterns(_ patterns: [(String, NSColor)], to ts: NSTextStorage, in str: String) {
+        for (pattern, color) in patterns {
+            apply(pattern: pattern, to: ts, in: str) { range in
+                ts.addAttribute(.foregroundColor, value: color, range: range)
+            }
+        }
+    }
+
+    private func apply(
+        pattern: String,
+        to ts: NSTextStorage,
+        in str: String,
+        options: NSRegularExpression.Options = [.anchorsMatchLines],
+        action: (NSRange) -> Void
+    ) {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else { return }
+        let full = NSRange(location: 0, length: (str as NSString).length)
+        regex.enumerateMatches(in: str, options: [], range: full) { match, _, _ in
+            guard let range = match?.range else { return }
+            action(range)
+        }
+    }
+}
