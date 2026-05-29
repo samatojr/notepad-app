@@ -14,8 +14,14 @@ BG_PNG="/tmp/dmg_background_$VERSION.png"
 rm -f "$RW_DMG"
 
 # ── 1. Background image ───────────────────────────────────────────────────────
-echo "→ Generating background image…"
-swift "$SCRIPT_DIR/make_dmg_background.swift" "$BG_PNG"
+# Use a pre-made background if it exists alongside this script, otherwise generate one
+if [ -f "$SCRIPT_DIR/dmg_background.png" ]; then
+    echo "→ Using pre-made background image…"
+    cp "$SCRIPT_DIR/dmg_background.png" "$BG_PNG"
+else
+    echo "→ Generating background image…"
+    swift "$SCRIPT_DIR/make_dmg_background.swift" "$BG_PNG"
+fi
 
 # ── 2. Create empty r/w DMG ───────────────────────────────────────────────────
 echo "→ Creating r/w DMG…"
@@ -34,6 +40,8 @@ for e in pl.get('system-entities', []):
         break
 " <<< "$MOUNT_OUT")
 echo "  Mounted at: $MOUNT_POINT"
+# Use the actual volume name from the mount point (may differ from VOL_NAME if suffixed)
+VOL_ACTUAL=$(basename "$MOUNT_POINT")
 
 # ── 4. Populate (background image goes in a VISIBLE folder first) ─────────────
 echo "→ Copying files…"
@@ -46,7 +54,7 @@ cp "$BG_PNG"   "$MOUNT_POINT/dmgbg/background.png"
 echo "→ Setting Finder layout (waiting for Finder to discover volume)…"
 sleep 4
 
-osascript - "$MOUNT_POINT" "$VOL_NAME" << 'APPLESCRIPT'
+osascript - "$MOUNT_POINT" "$VOL_ACTUAL" << 'APPLESCRIPT'
 on run argv
     set mountPoint to item 1 of argv
     set volName    to item 2 of argv
@@ -68,7 +76,12 @@ on run argv
             set current view of container window to icon view
             set toolbar visible of container window to false
             set statusbar visible of container window to false
-            set the bounds of container window to {200, 150, 740, 530}
+            -- Window bounds: width=540 matches image; height=380+22 for title bar overhead
+            -- bounds = {left, top, right, bottom}
+            -- width = 540 (matches image width exactly)
+            -- height = image (380) + chrome overhead (title bar ~28 + tab bar ~28 + status bar ~22 = ~78) + 10 padding = ~468
+            -- bottom = top (150) + 468 = 618
+            set the bounds of container window to {200, 150, 740, 627}
 
             set opts to the icon view options of container window
             set arrangement of opts to not arranged
@@ -76,9 +89,9 @@ on run argv
             set background picture of opts to POSIX file bgPath
 
             -- Notepad on LEFT, Applications on RIGHT
-            set position of item "Notepad.app"  of container window to {140, 185}
-            set position of item "Applications" of container window to {390, 185}
-            set position of item "dmgbg"        of container window to {650, 185}
+            set position of item "Notepad.app"  of container window to {140, 210}
+            set position of item "Applications" of container window to {390, 210}
+            set position of item "dmgbg"        of container window to {650, 210}
 
             update without registering applications
             delay 4
