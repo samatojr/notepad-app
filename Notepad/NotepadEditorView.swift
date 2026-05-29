@@ -35,6 +35,14 @@ private final class NotepadTextView: NSTextView {
         return super.performDragOperation(sender)
     }
 
+    /// Strip all formatting on paste — insert plain text only.
+    override func paste(_ sender: Any?) {
+        let pb = NSPasteboard.general
+        if let plain = pb.string(forType: .string) {
+            insertText(plain, replacementRange: selectedRange())
+        }
+    }
+
 }
 
 // MARK: - Editor View
