@@ -5,14 +5,60 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Open one extra window per remaining session state (first already consumed by initial window)
+        // Restore previous session tabs
         let extraCount = SessionManager.shared.pendingCount()
-        guard extraCount > 0 else { return }
-        for i in 0..<extraCount {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + Double(i) * 0.15) {
-                NotificationCenter.default.post(name: .openSessionTab, object: nil)
+        if extraCount > 0 {
+            for i in 0..<extraCount {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + Double(i) * 0.15) {
+                    NotificationCenter.default.post(name: .openSessionTab, object: nil)
+                }
             }
         }
+        // Set the correct icon for the current appearance and watch for changes
+        updateDockIcon()
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(systemAppearanceChanged),
+            name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil
+        )
+        // Background update check — only shows UI if a newer build is available
+        UpdateChecker.shared.checkOnLaunch()
+    }
+
+    @objc private func systemAppearanceChanged() {
+        DispatchQueue.main.async { self.updateDockIcon() }
+    }
+
+    private func updateDockIcon() {
+        let isDark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        if isDark {
+            // Load the dark icon and apply a squircle mask — macOS 11+ no longer
+            // adds the squircle automatically for programmatically-set icons.
+            if let img = NSImage(named: "AppIconDark") {
+                NSApplication.shared.applicationIconImage = squircled(img)
+            }
+        } else {
+            // Nil resets to the compiled AppIcon.appiconset, which Xcode's asset
+            // catalog compiler already renders with the correct squircle.
+            NSApplication.shared.applicationIconImage = nil
+        }
+    }
+
+    /// Clips an image to the macOS squircle shape (≈22.6% corner radius).
+    private func squircled(_ source: NSImage) -> NSImage {
+        let side: CGFloat = 1024
+        let sz   = NSSize(width: side, height: side)
+        let result = NSImage(size: sz)
+        result.lockFocus()
+        let path = NSBezierPath(roundedRect: NSRect(origin: .zero, size: sz),
+                                xRadius: side * 0.2257,
+                                yRadius: side * 0.2257)
+        path.addClip()
+        source.draw(in: NSRect(origin: .zero, size: sz),
+                    from: .zero, operation: .sourceOver, fraction: 1)
+        result.unlockFocus()
+        return result
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -121,6 +167,12 @@ struct NotepadCommands: Commands {
                 .keyboardShortcut("S")
         }
 
+        CommandGroup(replacing: .appInfo) {
+            Button("Check for Updates…") { UpdateChecker.shared.checkNow() }
+            Divider()
+        }
+
+        // ── Edit menu additions ──────────────────────────────────────────────
         CommandGroup(after: .pasteboard) {
             Divider()
             Button("Find & Replace…") { document?.showFindReplace = true }
@@ -129,17 +181,6 @@ struct NotepadCommands: Commands {
                 .keyboardShortcut("g")
             Button("Find Previous") { document?.findPrevious() }
                 .keyboardShortcut("G")
-        }
-
-        CommandMenu("Format") {
-            Toggle(isOn: Binding(
-                get: { document?.wordWrap ?? true },
-                set: { document?.wordWrap = $0 }
-            )) { Text("Word Wrap") }
-            Toggle(isOn: Binding(
-                get: { document?.showStatusBar ?? true },
-                set: { document?.showStatusBar = $0 }
-            )) { Text("Status Bar") }
             Divider()
             Button("Word Count…") { document?.showWordCount = true }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
@@ -149,6 +190,19 @@ struct NotepadCommands: Commands {
             }
             .keyboardShortcut("p", modifiers: [.command, .option])
             .disabled(!(document?.language.canPrettyPrint ?? false))
+        }
+
+        // ── View menu ────────────────────────────────────────────────────────
+        CommandGroup(after: .toolbar) {
+            Divider()
+            Toggle(isOn: Binding(
+                get: { document?.wordWrap ?? true },
+                set: { document?.wordWrap = $0 }
+            )) { Text("Word Wrap") }
+            Toggle(isOn: Binding(
+                get: { document?.showStatusBar ?? true },
+                set: { document?.showStatusBar = $0 }
+            )) { Text("Status Bar") }
             Divider()
             Button("Zoom In")     { document?.fontSize = min(28, (document?.fontSize ?? 13) + 1) }
                 .keyboardShortcut("=", modifiers: .command)
@@ -188,10 +242,7 @@ struct NotepadCommands: Commands {
         } else {
             Menu("Open Recent") {
                 ForEach(recents.recentURLs, id: \.self) { url in
-                    Menu(url.lastPathComponent) {
-                        Button("Open") { document?.loadFile(from: url) }
-                        Button("Remove from Recent") { recents.remove(url) }
-                    }
+                    Button(url.lastPathComponent) { document?.loadFile(from: url) }
                 }
                 Divider()
                 Button("Clear All") { recents.clearAll() }
