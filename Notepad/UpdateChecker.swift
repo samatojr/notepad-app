@@ -96,10 +96,18 @@ final class UpdateChecker {
                 if let error { self.showError(error.localizedDescription); return }
                 guard let tempURL else { self.showError("Download failed."); return }
 
-                // Move zip out of the sandbox temp location before mounting
+                // Move download out of the system temp location before mounting
                 let dest = FileManager.default.temporaryDirectory
                     .appendingPathComponent("NotepadUpdate-\(UUID().uuidString).dmg")
-                try? FileManager.default.moveItem(at: tempURL, to: dest)
+                do {
+                    try FileManager.default.moveItem(at: tempURL, to: dest)
+                } catch {
+                    self.showError("Could not save the downloaded update: \(error.localizedDescription)")
+                    return
+                }
+                // Strip quarantine attribute — URLSession tags downloads with
+                // com.apple.quarantine which can cause hdiutil to refuse mounting
+                _ = self.run("/usr/bin/xattr", args: ["-d", "com.apple.quarantine", dest.path])
                 self.mountAndInstall(dmgURL: dest, version: info.version)
             }
         }.resume()
