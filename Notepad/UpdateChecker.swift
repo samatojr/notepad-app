@@ -96,7 +96,7 @@ final class UpdateChecker {
                 if let error { self.showError(error.localizedDescription); return }
                 guard let tempURL else { self.showError("Download failed."); return }
 
-                // Move download out of the system temp location before mounting
+                // Move to a stable path with .dmg extension before opening
                 let dest = FileManager.default.temporaryDirectory
                     .appendingPathComponent("NotepadUpdate-\(UUID().uuidString).dmg")
                 do {
@@ -105,115 +105,30 @@ final class UpdateChecker {
                     self.showError("Could not save the downloaded update: \(error.localizedDescription)")
                     return
                 }
-                // Strip quarantine attribute — URLSession tags downloads with
-                // com.apple.quarantine which can cause hdiutil to refuse mounting
-                _ = self.run("/usr/bin/xattr", args: ["-d", "com.apple.quarantine", dest.path])
-                self.mountAndInstall(dmgURL: dest, version: info.version)
+                self.openDMGForInstall(dmgURL: dest, version: info.version)
             }
         }.resume()
     }
 
-    // MARK: - Mount → Copy → Relaunch
+    // MARK: - Open DMG for install
 
-    private func mountAndInstall(dmgURL: URL, version: String) {
-        let panel = makeProgressPanel(message: "Installing Notepad \(version)…")
-        panel.makeKeyAndOrderFront(nil)
+    private func openDMGForInstall(dmgURL: URL, version: String) {
+        // Open the DMG with NSWorkspace — macOS mounts it and shows the Finder
+        // installer window. Simpler and more reliable than mounting via hdiutil.
+        NSWorkspace.shared.open(dmgURL)
 
-        DispatchQueue.global(qos: .userInitiated).async {
-            // Mount the DMG silently
-            let mountPoint = self.run("/usr/bin/hdiutil",
-                args: ["attach", dmgURL.path, "-nobrowse", "-mountrandom", "/tmp", "-plist"])
-
-            // Parse the mount point from hdiutil's plist output
-            guard let mountPath = self.parseMountPoint(from: mountPoint) else {
-                DispatchQueue.main.async {
-                    panel.orderOut(nil)
-                    self.showError("Could not mount the update disk image.")
-                }
-                return
-            }
-
-            defer {
-                _ = self.run("/usr/bin/hdiutil", args: ["detach", mountPath, "-quiet"])
-                try? FileManager.default.removeItem(at: dmgURL)
-            }
-
-            // Find the .app inside the mounted volume
-            let fm = FileManager.default
-            guard let appName = (try? fm.contentsOfDirectory(atPath: mountPath))?
-                    .first(where: { $0.hasSuffix(".app") })
-            else {
-                DispatchQueue.main.async {
-                    panel.orderOut(nil)
-                    self.showError("Could not find the app inside the update.")
-                }
-                return
-            }
-
-            let sourceApp = URL(fileURLWithPath: mountPath).appendingPathComponent(appName)
-            let currentApp = Bundle.main.bundleURL
-            let destination = currentApp.deletingLastPathComponent().appendingPathComponent(appName)
-
-            // Replace running app with new version
-            var resultURL: NSURL?
-            let replaceError: Error?
-            do {
-                try fm.replaceItem(at: destination,
-                                   withItemAt: sourceApp,
-                                   backupItemName: nil,
-                                   options: [],
-                                   resultingItemURL: &resultURL)
-                replaceError = nil
-            } catch {
-                replaceError = error
-            }
-
-            DispatchQueue.main.async {
-                panel.orderOut(nil)
-                if let replaceError {
-                    self.showError("Could not replace the app: \(replaceError.localizedDescription)")
-                    return
-                }
-                // Small delay so the DMG can be detached before we relaunch
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    let finalURL = (resultURL as URL?) ?? destination
-                    let config = NSWorkspace.OpenConfiguration()
-                    NSWorkspace.shared.openApplication(at: finalURL, configuration: config) { _, _ in }
-                    NSApp.terminate(nil)
-                }
-            }
+        let alert = NSAlert.make()
+        alert.messageText = "Notepad \(version) is ready to install"
+        alert.informativeText = "Drag Notepad from the installer window into your Applications folder, then relaunch."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Quit Notepad")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSApp.terminate(nil)
         }
     }
 
     // MARK: - Helpers
-
-    @discardableResult
-    private func run(_ path: String, args: [String]) -> String {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = Pipe()
-        try? p.run()
-        p.waitUntilExit()
-        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-    }
-
-    private func parseMountPoint(from plistOutput: String) -> String? {
-        guard let data = plistOutput.data(using: .utf8),
-              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil),
-              let dict = plist as? [String: Any],
-              let entities = dict["system-entities"] as? [[String: Any]]
-        else { return nil }
-
-        for entity in entities {
-            if let point = entity["mount-point"] as? String {
-                return point
-            }
-        }
-        return nil
-    }
 
     private func makeProgressPanel(message: String) -> NSPanel {
         let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 300, height: 70),
