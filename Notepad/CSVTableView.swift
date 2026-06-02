@@ -1,10 +1,22 @@
 import SwiftUI
 import AppKit
 
-// MARK: - NSTableView subclass for ⌘C copy support
+// MARK: - Editable cell field
+
+final class CSVEditableField: NSTextField {
+    var onCommit: ((String) -> Void)?
+
+    override func textDidEndEditing(_ notification: Notification) {
+        super.textDidEndEditing(notification)
+        onCommit?(stringValue)
+    }
+}
+
+// MARK: - NSTableView subclass for ⌘C copy + right-click menu
 
 final class CopyableTableView: NSTableView {
-    var copyHandler: (() -> Void)?
+    var copyHandler:   (() -> Void)?
+    var deleteHandler: (() -> Void)?
 
     override func keyDown(with event: NSEvent) {
         if event.modifierFlags.contains(.command),
@@ -15,15 +27,33 @@ final class CopyableTableView: NSTableView {
         }
     }
 
-    @objc func copy(_ sender: Any?) {
-        copyHandler?()
+    @objc func copy(_ sender: Any?) { copyHandler?() }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let row   = self.row(at: point)
+        if row >= 0 && !selectedRowIndexes.contains(row) {
+            selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        guard !selectedRowIndexes.isEmpty else { return nil }
+
+        let menu  = NSMenu()
+        let count = selectedRowIndexes.count
+        let label = count == 1 ? "Delete Row" : "Delete \(count) Rows"
+        let item  = NSMenuItem(title: label, action: #selector(deleteRows(_:)),
+                               keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        return menu
     }
+
+    @objc private func deleteRows(_ sender: Any?) { deleteHandler?() }
 }
 
 // MARK: - Find match coordinate
 
 struct CSVMatch: Equatable {
-    let row: Int   // 0-indexed data row
+    let row: Int   // 0-indexed display row (into displayOrder)
     let col: Int
 }
 
@@ -45,7 +75,8 @@ struct CSVTableView: NSViewRepresentable {
         dataTable.delegate                           = coord
         dataTable.dataSource                         = coord
         dataTable.columnAutoresizingStyle            = .noColumnAutoresizing
-        dataTable.copyHandler = { [weak coord] in coord?.copySelectedRows() }
+        dataTable.copyHandler   = { [weak coord] in coord?.copySelectedRows() }
+        dataTable.deleteHandler = { [weak coord] in coord?.deleteSelectedRows() }
 
         let scrollView = NSScrollView()
         scrollView.documentView          = dataTable
@@ -73,6 +104,9 @@ struct CSVTableView: NSViewRepresentable {
         weak var dataScroll: NSScrollView?
         var document: NotepadDocument?
 
+        // Display order: indices into doc.csvRows for each table row
+        private var displayOrder: [Int] = []
+
         // Find state
         private var findMatches:       [CSVMatch] = []
         private var currentMatchIndex: Int        = -1
@@ -83,6 +117,7 @@ struct CSVTableView: NSViewRepresentable {
         private var lastPaperTheme:     PaperTheme?
         private var lastShowRowNumbers: Bool = false
         private var lastShowHeaders:    Bool = true
+        private var lastSortKeys:       [CSVSortKey] = []
 
         // MARK: Helpers
 
@@ -97,9 +132,49 @@ struct CSVTableView: NSViewRepresentable {
             return result
         }
 
-        /// The rows treated as data (respects the Headers toggle).
-        private func dataRows(in doc: NotepadDocument) -> ArraySlice<CSVRow> {
-            doc.csvShowHeaders ? doc.csvRows.dropFirst() : doc.csvRows[...]
+        // MARK: Display order (sort)
+
+        func rebuildDisplayOrder(in doc: NotepadDocument) {
+            let offset = doc.csvShowHeaders ? 1 : 0
+            let total  = doc.csvRows.count
+            guard total > offset else { displayOrder = []; return }
+
+            var order = Array(offset..<total)
+
+            let keys = doc.csvSortKeys
+            guard !keys.isEmpty else { displayOrder = order; return }
+
+            order.sort { a, b in
+                for key in keys {
+                    let va = key.column < doc.csvRows[a].cells.count ? doc.csvRows[a].cells[key.column] : ""
+                    let vb = key.column < doc.csvRows[b].cells.count ? doc.csvRows[b].cells[key.column] : ""
+                    if va == vb { continue }
+                    if let na = Double(va), let nb = Double(vb) {
+                        return key.ascending ? na < nb : na > nb
+                    }
+                    let cmp = va.localizedCompare(vb)
+                    return key.ascending ? cmp == .orderedAscending : cmp == .orderedDescending
+                }
+                return false
+            }
+
+            displayOrder = order
+        }
+
+        private func applySortIndicators() {
+            guard let dt = tableView, let doc = document else { return }
+            for col in dt.tableColumns { dt.setIndicatorImage(nil, in: col) }
+            dt.highlightedTableColumn = nil
+
+            for (i, key) in doc.csvSortKeys.enumerated() {
+                let colID = NSUserInterfaceItemIdentifier("col_\(key.column)")
+                guard let col = dt.tableColumns.first(where: { $0.identifier == colID }) else { continue }
+                let img = key.ascending
+                    ? NSImage(named: "NSAscendingSortIndicator")
+                    : NSImage(named: "NSDescendingSortIndicator")
+                dt.setIndicatorImage(img, in: col)
+                if i == 0 { dt.highlightedTableColumn = col }
+            }
         }
 
         // MARK: Column setup
@@ -110,8 +185,8 @@ struct CSVTableView: NSViewRepresentable {
             guard !doc.csvRows.isEmpty else { dt.reloadData(); return }
 
             let showHeaders = doc.csvShowHeaders
-            let allData     = dataRows(in: doc)
-            let dataCount   = allData.count
+            let offset      = showHeaders ? 1 : 0
+            let dataCount   = max(0, doc.csvRows.count - offset)
 
             // ── Optional row-number column ───────────────────────────────────
             if doc.csvShowRowNumbers {
@@ -126,20 +201,13 @@ struct CSVTableView: NSViewRepresentable {
             }
 
             // ── Column titles & widths ───────────────────────────────────────
-            // Headers ON  → titles come from row 0; data sampled from rows 1+
-            // Headers OFF → titles are A/B/C…;      data sampled from all rows
-            let titleRow: [String] = showHeaders
-                ? (doc.csvRows.first?.cells ?? [])
-                : []
+            let titleRow: [String] = showHeaders ? (doc.csvRows.first?.cells ?? []) : []
             let colCount: Int = showHeaders
                 ? (doc.csvRows.first?.cells.count ?? 0)
                 : (doc.csvRows.map(\.cells.count).max() ?? 0)
 
-            let sample = Array(allData.prefix(200))
-
-            // When headers are off, the first CSV row (original "header") is
-            // now data row 0. Its values can be much wider than the single-letter
-            // column label, so we use them as an additional width floor.
+            let allData       = showHeaders ? doc.csvRows.dropFirst() : doc.csvRows[...]
+            let sample        = Array(allData.prefix(200))
             let firstRowCells = doc.csvRows.first?.cells ?? []
 
             for i in 0..<colCount {
@@ -149,29 +217,84 @@ struct CSVTableView: NSViewRepresentable {
 
                 let col = NSTableColumn(identifier: .init("col_\(i)"))
                 col.title      = title
-                col.isEditable = false
-
-                // Center letter-style (A/B/C…) headers; leave named headers left-aligned
-                if !showHeaders {
-                    col.headerCell.alignment = .center
-                }
+                col.isEditable = true
+                if !showHeaders { col.headerCell.alignment = .center }
 
                 let avgChars: CGFloat = sample.isEmpty ? 0 : {
                     let total = sample.reduce(0) { $0 + (i < $1.cells.count ? $1.cells[i].count : 0) }
                     return CGFloat(total) / CGFloat(sample.count)
                 }()
-
-                // Take the largest of: column label, avg data, first-row value
-                // (first-row matters most when headers are off — it was the header)
                 let firstRowChars = i < firstRowCells.count ? CGFloat(firstRowCells[i].count) : 0
-                let minWidth: CGFloat = 30
-                let chars    = max(CGFloat(title.count), avgChars, firstRowChars)
-                col.minWidth = minWidth
-                col.width    = min(300, max(minWidth, chars * 8.0 + 8))
+                let chars = max(CGFloat(title.count), avgChars, firstRowChars)
+                col.minWidth = 30
+                col.width    = min(300, max(30, chars * 8.0 + 8))
                 dt.addTableColumn(col)
             }
 
+            rebuildDisplayOrder(in: doc)
+            applySortIndicators()
             dt.reloadData()
+        }
+
+        // MARK: Commit cell edit
+
+        func commitEdit(tableRow: Int, colIdx: Int, value: String) {
+            guard let doc   = document,
+                  let delim = doc.csvDelimiter,
+                  displayOrder.indices.contains(tableRow) else { return }
+
+            let csvIdx = displayOrder[tableRow]
+            guard csvIdx < doc.csvRows.count,
+                  colIdx < doc.csvRows[csvIdx].cells.count,
+                  doc.csvRows[csvIdx].cells[colIdx] != value else { return }
+
+            doc.csvRows[csvIdx].cells[colIdx] = value
+            doc.text       = serializeDelimited(doc.csvRows, delimiter: delim)
+            doc.isModified = true
+        }
+
+        // MARK: Delete selected rows
+
+        func deleteSelectedRows() {
+            guard let dt    = tableView,
+                  let doc   = document,
+                  let delim = doc.csvDelimiter else { return }
+
+            let selected = dt.selectedRowIndexes
+            guard !selected.isEmpty else { return }
+
+            let csvIndices = selected.compactMap {
+                displayOrder.indices.contains($0) ? displayOrder[$0] : nil
+            }
+            doc.csvRows.remove(atOffsets: IndexSet(csvIndices))
+            doc.text       = serializeDelimited(doc.csvRows, delimiter: delim)
+            doc.isModified = true
+
+            rebuildDisplayOrder(in: doc)
+            dt.reloadData()
+        }
+
+        // MARK: Column header click → sort
+
+        func tableView(_ tableView: NSTableView, didClick tableColumn: NSTableColumn) {
+            guard let doc = document,
+                  tableColumn.identifier.rawValue != "col_rownum",
+                  let colIdxStr = tableColumn.identifier.rawValue.split(separator: "_").last,
+                  let colIdx    = Int(colIdxStr) else { return }
+
+            if let idx = doc.csvSortKeys.firstIndex(where: { $0.column == colIdx }) {
+                if doc.csvSortKeys[idx].ascending {
+                    doc.csvSortKeys[idx].ascending = false
+                } else {
+                    doc.csvSortKeys.remove(at: idx)
+                }
+            } else {
+                doc.csvSortKeys.append(CSVSortKey(column: colIdx, ascending: true))
+            }
+
+            rebuildDisplayOrder(in: doc)
+            applySortIndicators()
+            tableView.reloadData()
         }
 
         // MARK: Observation
@@ -189,9 +312,7 @@ struct CSVTableView: NSViewRepresentable {
                     if findText != lastFindText || caseSensitive != lastCaseSensitive {
                         lastFindText      = findText
                         lastCaseSensitive = caseSensitive
-                        rebuildFindMatches(findText: findText,
-                                          caseSensitive: caseSensitive,
-                                          dataRows: Array(dataRows(in: doc)))
+                        rebuildFindMatches(findText: findText, caseSensitive: caseSensitive)
                         currentMatchIndex = findMatches.isEmpty ? -1 : 0
                     } else if !findMatches.isEmpty {
                         let count         = findMatches.count
@@ -224,6 +345,14 @@ struct CSVTableView: NSViewRepresentable {
                     return
                 }
 
+                // ── Sort changed → rebuild display order ──────────────────────
+                let sortKeys = doc.csvSortKeys
+                if sortKeys != lastSortKeys {
+                    lastSortKeys = sortKeys
+                    rebuildDisplayOrder(in: doc)
+                    applySortIndicators()
+                }
+
                 // ── Paper theme ───────────────────────────────────────────────
                 let theme = AppPreferences.shared.paperTheme
                 if theme != lastPaperTheme {
@@ -231,6 +360,8 @@ struct CSVTableView: NSViewRepresentable {
                     lastPaperTheme = theme
                 }
 
+                // Always refresh display order before reload so edits/deletes stay consistent
+                rebuildDisplayOrder(in: doc)
                 dt.reloadData()
 
             } onChange: { [weak self] in
@@ -248,17 +379,16 @@ struct CSVTableView: NSViewRepresentable {
 
         // MARK: Find
 
-        private func rebuildFindMatches(findText: String,
-                                        caseSensitive: Bool,
-                                        dataRows: [CSVRow]) {
+        private func rebuildFindMatches(findText: String, caseSensitive: Bool) {
             findMatches = []
-            guard !findText.isEmpty else { return }
+            guard let doc = document, !findText.isEmpty else { return }
             let needle = caseSensitive ? findText : findText.lowercased()
-            for (rowIdx, row) in dataRows.enumerated() {
-                for (colIdx, cell) in row.cells.enumerated() {
+            for (displayRow, csvIdx) in displayOrder.enumerated() {
+                let cells = doc.csvRows[csvIdx].cells
+                for (colIdx, cell) in cells.enumerated() {
                     let hay = caseSensitive ? cell : cell.lowercased()
                     if hay.contains(needle) {
-                        findMatches.append(CSVMatch(row: rowIdx, col: colIdx))
+                        findMatches.append(CSVMatch(row: displayRow, col: colIdx))
                     }
                 }
             }
@@ -267,18 +397,16 @@ struct CSVTableView: NSViewRepresentable {
         // MARK: Copy
 
         func copySelectedRows() {
-            guard let dt = tableView, let doc = document,
+            guard let dt    = tableView,
+                  let doc   = document,
                   let delim = doc.csvDelimiter else { return }
 
             let selected = dt.selectedRowIndexes
             guard !selected.isEmpty else { return }
 
-            // When headers are off, NSTableView row 0 = csvRows[0]
-            let offset = doc.csvShowHeaders ? 1 : 0
-            let rows = selected.compactMap { dataRow -> CSVRow? in
-                let csvIdx = dataRow + offset
-                guard csvIdx < doc.csvRows.count else { return nil }
-                return doc.csvRows[csvIdx]
+            let rows = selected.compactMap { displayRow -> CSVRow? in
+                guard displayOrder.indices.contains(displayRow) else { return nil }
+                return doc.csvRows[displayOrder[displayRow]]
             }
 
             let csv = serializeDelimited(rows, delimiter: delim)
@@ -288,12 +416,7 @@ struct CSVTableView: NSViewRepresentable {
 
         // MARK: NSTableViewDataSource
 
-        func numberOfRows(in tableView: NSTableView) -> Int {
-            guard let doc = document, !doc.csvRows.isEmpty else { return 0 }
-            // Headers ON: row 0 is the header, data starts at row 1
-            // Headers OFF: all rows are data
-            return doc.csvShowHeaders ? max(0, doc.csvRows.count - 1) : doc.csvRows.count
-        }
+        func numberOfRows(in tableView: NSTableView) -> Int { displayOrder.count }
 
         // MARK: NSTableViewDelegate — cell views
 
@@ -302,39 +425,52 @@ struct CSVTableView: NSViewRepresentable {
                        row: Int) -> NSView? {
             guard let col = tableColumn, let doc = document else { return nil }
 
+            // ── Row-number column (non-editable) ─────────────────────────────
+            if col.identifier.rawValue == "col_rownum" {
+                let numID = NSUserInterfaceItemIdentifier("rownum_cell")
+                var lbl = tableView.makeView(withIdentifier: numID, owner: nil) as? NSTextField
+                if lbl == nil {
+                    let f = NSTextField()
+                    f.identifier      = numID
+                    f.isEditable      = false
+                    f.isBezeled       = false
+                    f.drawsBackground = false
+                    f.alignment       = .center
+                    lbl = f
+                }
+                lbl?.stringValue = "\(row + 1)"
+                lbl?.textColor   = .tertiaryLabelColor
+                return lbl
+            }
+
+            guard let colIdxStr = col.identifier.rawValue.split(separator: "_").last,
+                  let colIdx    = Int(colIdxStr) else { return nil }
+
+            // ── Data cell (editable) ─────────────────────────────────────────
             let cellID = NSUserInterfaceItemIdentifier("data_cell")
-            var tf = tableView.makeView(withIdentifier: cellID, owner: nil) as? NSTextField
-            if tf == nil {
-                let f = NSTextField()
+            var field = tableView.makeView(withIdentifier: cellID, owner: nil) as? CSVEditableField
+            if field == nil {
+                let f = CSVEditableField()
                 f.identifier      = cellID
-                f.isEditable      = false
+                f.isEditable      = true
                 f.isBezeled       = false
                 f.lineBreakMode   = .byTruncatingTail
                 f.drawsBackground = true
                 f.backgroundColor = .clear
-                tf = f
+                field = f
             }
-            guard let field = tf else { return nil }
+            guard let f = field else { return nil }
 
-            // Row-number column
-            if col.identifier.rawValue == "col_rownum" {
-                field.stringValue     = "\(row + 1)"
-                field.textColor       = .tertiaryLabelColor
-                field.alignment       = .center
-                field.drawsBackground = false
-                field.backgroundColor = .clear
-                return field
+            // Refresh commit closure with current row/col
+            f.onCommit = { [weak self] newValue in
+                self?.commitEdit(tableRow: row, colIdx: colIdx, value: newValue)
             }
 
-            guard let colIdxStr = col.identifier.rawValue.split(separator: "_").last,
-                  let colIdx    = Int(colIdxStr) else { return field }
-
-            // Headers ON: NSTableView row 0 → csvRows[1]; OFF: row 0 → csvRows[0]
-            let csvIdx = doc.csvShowHeaders ? row + 1 : row
-            let cells  = csvIdx < doc.csvRows.count ? doc.csvRows[csvIdx].cells : []
-            field.stringValue = colIdx < cells.count ? cells[colIdx] : ""
-            field.textColor   = .labelColor
-            field.alignment   = .left
+            let csvIdx = displayOrder.indices.contains(row) ? displayOrder[row] : -1
+            let cells  = csvIdx >= 0 && csvIdx < doc.csvRows.count ? doc.csvRows[csvIdx].cells : []
+            f.stringValue = colIdx < cells.count ? cells[colIdx] : ""
+            f.textColor   = .labelColor
+            f.alignment   = .left
 
             // Find highlighting
             let match     = CSVMatch(row: row, col: colIdx)
@@ -344,17 +480,17 @@ struct CSVTableView: NSViewRepresentable {
             let isAny     = !isCurrent && findMatches.contains(match)
 
             if isCurrent {
-                field.drawsBackground = true
-                field.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.45)
+                f.drawsBackground = true
+                f.backgroundColor = NSColor.systemOrange.withAlphaComponent(0.45)
             } else if isAny {
-                field.drawsBackground = true
-                field.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.35)
+                f.drawsBackground = true
+                f.backgroundColor = NSColor.systemYellow.withAlphaComponent(0.35)
             } else {
-                field.drawsBackground = false
-                field.backgroundColor = .clear
+                f.drawsBackground = false
+                f.backgroundColor = .clear
             }
 
-            return field
+            return f
         }
 
         func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 22 }
@@ -372,16 +508,13 @@ struct CSVTableView: NSViewRepresentable {
                   let colIdx    = Int(colIdxStr) else { return 80 }
 
             let headerWidth = CGFloat(col.title.count) * 7.0 + 8
-
             var maxChars: CGFloat = 0
-            for row in dataRows(in: doc) {
-                if colIdx < row.cells.count {
-                    maxChars = max(maxChars, CGFloat(row.cells[colIdx].count))
+            for csvIdx in displayOrder {
+                if colIdx < doc.csvRows[csvIdx].cells.count {
+                    maxChars = max(maxChars, CGFloat(doc.csvRows[csvIdx].cells[colIdx].count))
                 }
             }
-            let dataWidth = maxChars * 8.0 + 8
-
-            return min(600, max(30, max(headerWidth, dataWidth)))
+            return min(600, max(30, max(headerWidth, maxChars * 8.0 + 8)))
         }
     }
 }

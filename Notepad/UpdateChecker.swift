@@ -54,7 +54,7 @@ final class UpdateChecker {
         if info.build > currentBuild {
             showUpdateAvailable(info)
         } else if userInitiated {
-            let alert = NSAlert()
+            let alert = NSAlert.make()
             alert.messageText = "Notepad is up to date"
             alert.informativeText = "You're running version \(appVersion()) (build \(currentBuild))."
             alert.alertStyle = .informational
@@ -66,7 +66,7 @@ final class UpdateChecker {
     // MARK: - Update Prompt
 
     private func showUpdateAvailable(_ info: VersionInfo) {
-        let alert = NSAlert()
+        let alert = NSAlert.make()
         alert.messageText = "Notepad \(info.version) is available"
         alert.informativeText = """
             You have version \(appVersion()). \(info.releaseNotes)
@@ -232,7 +232,7 @@ final class UpdateChecker {
     }
 
     private func showError(_ message: String) {
-        let alert = NSAlert()
+        let alert = NSAlert.make()
         alert.messageText = "Update failed"
         alert.informativeText = message
         alert.alertStyle = .warning

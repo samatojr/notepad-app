@@ -82,6 +82,12 @@ enum PaperTheme: String, CaseIterable, Equatable {
 final class AppPreferences {
     static let shared = AppPreferences()
 
+    // EASTER EGG: AmatoPad mode toggle — persisted so it survives restarts.
+    // To remove: delete this property and all other // EASTER EGG comments.
+    var isAmatoPadMode: Bool {
+        didSet { UserDefaults.standard.set(isAmatoPadMode, forKey: "isAmatoPadMode") }
+    }
+
     var paperTheme: PaperTheme {
         didSet {
             UserDefaults.standard.set(paperTheme.rawValue, forKey: "paperTheme")
@@ -95,5 +101,7 @@ final class AppPreferences {
         } else {
             paperTheme = .system
         }
+        // EASTER EGG: restore persisted AmatoPad mode across launches
+        isAmatoPadMode = UserDefaults.standard.bool(forKey: "isAmatoPadMode")
     }
 }

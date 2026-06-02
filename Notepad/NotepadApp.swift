@@ -24,6 +24,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         // Background update check — only shows UI if a newer build is available
         UpdateChecker.shared.checkOnLaunch()
+        // EASTER EGG: observe the toggle notification fired when user types "amatopad" in Find.
+        // To remove: delete this addObserver call and the handleAmatoPadToggle method below.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAmatoPadToggle),
+            name: .amatoPadModeChanged,
+            object: nil
+        )
+
+        // EASTER EGG: re-apply all appearance changes on launch if mode was persisted
+        if AppPreferences.shared.isAmatoPadMode {
+            updateDockIcon()
+            // Delay slightly so SwiftUI finishes building the menu before we rename it
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                self.applyAmatoPadAppearance()
+            }
+        }
+    }
+
+    // EASTER EGG: called when the user triggers AmatoPad mode via the find bar.
+    // Swaps dock icon, forces dark mode, renames app in menu bar, shows alert.
+    // To remove: delete this method and the addObserver call above.
+    @objc private func handleAmatoPadToggle() {
+        updateDockIcon()
+        applyAmatoPadAppearance()
+        if AppPreferences.shared.isAmatoPadMode {
+            NSApp.requestUserAttention(.informationalRequest)
+            // EASTER EGG: NSAlert.make() automatically sets the AmatoPad icon
+            let alert = NSAlert.make()
+            alert.messageText = "Welcome to AmatoPad! 🎉"
+            alert.informativeText = "You've unlocked AmatoPad — the secret edition. Your friends were right all along."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Let's go!")
+            alert.runModal()
+        }
+    }
+
+    // EASTER EGG: forces dark mode and renames the app in the menu bar.
+    // NSApp.appearance overrides the system appearance for this process only.
+    // The app-menu title (bold name in top-left of menu bar) is the first mainMenu item's title.
+    // To remove: delete this method and its call in handleAmatoPadToggle.
+    private func applyAmatoPadAppearance() {
+        if AppPreferences.shared.isAmatoPadMode {
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+            NSApp.mainMenu?.items.first?.title = "AmatoPad"
+        } else {
+            NSApp.appearance = nil                              // restores system appearance
+            NSApp.mainMenu?.items.first?.title = "Notepad"     // restores original name
+        }
     }
 
     @objc private func systemAppearanceChanged() {
@@ -31,6 +80,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updateDockIcon() {
+        // EASTER EGG: swap to AmatoPad icon when mode is active.
+        // AmatoPadIconImage is Assets.xcassets/AmatoPadIconImage.imageset — safe to delete with the easter egg.
+        if AppPreferences.shared.isAmatoPadMode {
+            // EASTER EGG: squircle-mask the AmatoPad icon, same as the dark Notepad icon.
+            if let img = NSImage(named: "AmatoPadIconImage") {
+                NSApplication.shared.applicationIconImage = squircled(img)
+            }
+            return
+        }
         let isDark = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
         if isDark {
             // Load the dark icon and apply a squircle mask — macOS 11+ no longer
@@ -51,6 +109,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sz   = NSSize(width: side, height: side)
         let result = NSImage(size: sz)
         result.lockFocus()
+        // Clear to transparent — lockFocus() defaults to white otherwise
+        NSColor.clear.setFill()
+        NSBezierPath(rect: NSRect(origin: .zero, size: sz)).fill()
         let path = NSBezierPath(roundedRect: NSRect(origin: .zero, size: sz),
                                 xRadius: side * 0.2257,
                                 yRadius: side * 0.2257)
@@ -69,6 +130,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {}
+
+    // EASTER EGG: reapply the menu bar app name after every SwiftUI menu rebuild.
+    // SwiftUI regenerates NSMenuItems on state changes, resetting the title; this
+    // counteracts that by re-setting it on every app update cycle.
+    // To remove: delete this method.
+    func applicationDidUpdate(_ notification: Notification) {
+        guard AppPreferences.shared.isAmatoPadMode else { return }
+        if NSApp.mainMenu?.items.first?.title != "AmatoPad" {
+            NSApp.mainMenu?.items.first?.title = "AmatoPad"
+        }
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
@@ -108,6 +180,24 @@ extension Notification.Name {
     static let openFile          = Notification.Name("openFile")
     static let openSessionTab    = Notification.Name("openSessionTab")
     static let clearSession      = Notification.Name("clearSession")
+    // EASTER EGG: fired by findNext() when find text == "amatopad". To remove: delete this line.
+    static let amatoPadModeChanged = Notification.Name("amatoPadModeChanged")
+}
+
+// MARK: - NSAlert helper
+
+extension NSAlert {
+    // EASTER EGG: automatically swaps the alert icon to AmatoPadIconImage when
+    // AmatoPad mode is active. Call on every new NSAlert instead of setting .icon manually.
+    // To remove: delete this extension and revert all makeAlert() calls to NSAlert().
+    static func make() -> NSAlert {
+        let alert = NSAlert()
+        if AppPreferences.shared.isAmatoPadMode,
+           let img = NSImage(named: "AmatoPadIconImage") {
+            alert.icon = img
+        }
+        return alert
+    }
 }
 
 // MARK: - Focused Value Key
@@ -143,7 +233,7 @@ struct NotepadCommands: Commands {
             Button("Clear Session") {
                 // Prompt to save each modified document
                 for doc in DocumentRegistry.shared.allDocuments().filter({ $0.isModified }) {
-                    let alert = NSAlert()
+                    let alert = NSAlert.make()
                     alert.messageText = "Save changes to \"\(doc.displayName)\"?"
                     alert.informativeText = "Your unsaved changes will be lost if you clear the session."
                     alert.addButton(withTitle: "Save")

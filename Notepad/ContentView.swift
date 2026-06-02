@@ -29,6 +29,7 @@ final class NotepadDocument {
     var csvFindMatchIndex: Int        = 0     // signal for Next/Previous in table find
     var csvShowRowNumbers: Bool       = false // show # column in table view (off by default)
     var csvShowHeaders:   Bool       = true  // show column header row in table view (on by default)
+    var csvSortKeys: [CSVSortKey] = []   // ordered: first = primary sort
 
     var isBeingExplicitlyClosed: Bool = false  // set true when user deliberately closes; skips session restore
 
@@ -69,7 +70,11 @@ final class NotepadDocument {
             fontSize = state.fontSize ?? 13
             if let bm = state.bookmarkData, let url = SessionManager.shared.resolveBookmark(bm) {
                 bookmarkData = bm; fileURL = url
-                text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                if let saved = state.unsavedText {
+                    text = saved; isModified = true   // cached edits take priority over disk
+                } else {
+                    text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                }
             } else if let saved = state.unsavedText {
                 text = saved; isModified = true
             }
@@ -82,7 +87,11 @@ final class NotepadDocument {
             fontSize = state.fontSize ?? 13
             if let bm = state.bookmarkData, let url = SessionManager.shared.resolveBookmark(bm) {
                 bookmarkData = bm; fileURL = url
-                text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                if let saved = state.unsavedText {
+                    text = saved; isModified = true   // cached edits take priority over disk
+                } else {
+                    text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                }
             } else if let saved = state.unsavedText {
                 text = saved; isModified = true
             }
@@ -94,6 +103,7 @@ final class NotepadDocument {
     }
 
     private func restoreCSV(from state: DocumentSessionState) {
+        csvSortKeys = state.csvSortKeys ?? []
         if let delimStr = state.csvDelimiter, let delim = delimStr.first {
             parseCSVInBackground(text, delimiter: delim,
                                  showTable: state.csvIsTableView ?? true)
@@ -135,20 +145,29 @@ final class NotepadDocument {
     func sessionState(index: Int) -> DocumentSessionState {
         DocumentSessionState(
             sessionID: sessionID,
-            unsavedText: fileURL == nil ? text : nil,
+            unsavedText: (fileURL == nil || (csvDelimiter != nil && isModified)) ? text : nil,
             bookmarkData: bookmarkData,
             wordWrap: wordWrap,
             showStatusBar: showStatusBar,
             windowIndex: index,
             fontSize: fontSize,
             csvDelimiter: csvDelimiter.map { String($0) },
-            csvIsTableView: csvDelimiter != nil ? csvIsTableView : nil
+            csvIsTableView: csvDelimiter != nil ? csvIsTableView : nil,
+            csvSortKeys: csvSortKeys.isEmpty ? nil : csvSortKeys
         )
     }
 
     // MARK: Find
 
     func findNext() {
+        // EASTER EGG: typing "amatopad" in the find bar and pressing Return/⌘G triggers
+        // AmatoPad mode instead of a normal search. To remove: delete this if-block.
+        if findText.lowercased() == "amatopad" {
+            showFindReplace = false
+            AppPreferences.shared.isAmatoPadMode.toggle()
+            NotificationCenter.default.post(name: .amatoPadModeChanged, object: nil)
+            return
+        }
         if csvIsTableView { csvFindMatchIndex += 1; return }
         guard !findText.isEmpty else { return }
         let ns = text as NSString
@@ -317,7 +336,7 @@ final class NotepadDocument {
     }
 
     private func confirmDiscard() -> Bool {
-        let alert = NSAlert()
+        let alert = NSAlert.make()
         alert.messageText = "Discard changes to \"\(displayName)\"?"
         alert.informativeText = "Your unsaved changes will be lost."
         alert.addButton(withTitle: "Discard")
@@ -327,7 +346,7 @@ final class NotepadDocument {
     }
 
     private func presentError(_ message: String) {
-        let alert = NSAlert()
+        let alert = NSAlert.make()
         alert.messageText = "Error"
         alert.informativeText = message
         alert.alertStyle = .critical
@@ -397,6 +416,11 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 480, minHeight: 320)
+        // EASTER EGG: red accent color on window chrome (toolbar, status bar, menus) when
+        // AmatoPad mode is active. AppKit document views (NSTextView, NSTableView) are
+        // unaffected since they don't inherit SwiftUI accent color.
+        // To remove: delete this modifier and the AppPreferences.isAmatoPadMode property.
+        .accentColor(AppPreferences.shared.isAmatoPadMode ? .red : nil)
         .navigationTitle(windowTitle)
         .focusedValue(\.notepadDocument, document)
         .sheet(isPresented: $document.showWordCount) {
@@ -533,7 +557,7 @@ struct ContentView: View {
     }
 
     private func closeCurrentTab() {
-        let alert = NSAlert()
+        let alert = NSAlert.make()
         alert.messageText = "Close \"\(document.displayName)\"?"
         alert.informativeText = document.isModified
             ? "You have unsaved changes. They will be lost."
@@ -754,6 +778,17 @@ struct StatusBarView: View {
                 pill("Rows: \(max(0, document.csvRows.count - 1))")
                 Divider().frame(height: 12)
                 pill("Columns: \(document.csvRows.first?.cells.count ?? 0)")
+                if !document.csvSortKeys.isEmpty {
+                    Divider().frame(height: 12)
+                    Button(action: { document.csvSortKeys = [] }) {
+                        Text("Sorted")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 8)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear all sorting")
+                }
             } else {
                 // ── Text mode: word / char / line counts ──────────────────
                 pill("Words: \(words)")
@@ -773,6 +808,22 @@ struct StatusBarView: View {
             }
 
             Spacer()
+
+            // EASTER EGG: persistent "AmatoPad" badge in the status bar.
+            // To remove: delete this entire if-block.
+            if AppPreferences.shared.isAmatoPadMode {
+                Divider().frame(height: 12)
+                Text("AmatoPad")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [.purple, .pink],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+                    .padding(.horizontal, 8)
+            }
 
             // ── Word Wrap toggle (text mode only) ─────────────────────────
             if !inTableView {

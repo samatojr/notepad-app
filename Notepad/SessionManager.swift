@@ -2,6 +2,13 @@ import Foundation
 import AppKit
 import Combine
 
+// MARK: - CSV sort key
+
+struct CSVSortKey: Codable, Equatable {
+    var column: Int
+    var ascending: Bool
+}
+
 // MARK: - Persisted state for one document
 
 struct DocumentSessionState: Codable {
@@ -12,9 +19,10 @@ struct DocumentSessionState: Codable {
     var showStatusBar: Bool
     var windowIndex: Int              // ordering for restore
     var fontSize: CGFloat?            // nil → default 13; optional for old-session compat
-    // CSV/TSV view state — both optional for backward compat with pre-2.2 sessions
+    // CSV/TSV view state — all optional for backward compat with pre-2.2 sessions
     var csvDelimiter: String?         // "," or "\t"; nil = not a tabular file
     var csvIsTableView: Bool?         // nil = not applicable
+    var csvSortKeys: [CSVSortKey]?    // nil / empty = unsorted
 }
 
 // MARK: - Session Manager
