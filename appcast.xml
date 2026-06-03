@@ -6,6 +6,26 @@
         <description>Updates for Notepad</description>
         <language>en</language>
         <item>
+            <title>3.2</title>
+            <sparkle:version>27</sparkle:version>
+            <sparkle:shortVersionString>3.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[
+                <ul>
+                    <li>Paste from Google Sheets now auto-switches to grid mode (5+ rows).</li>
+                    <li>New seamless automatic updates.</li>
+                    <li>About Notepad shows the current version.</li>
+                </ul>
+            ]]></description>
+            <pubDate>Wed, 03 Jun 2026 23:35:18 +0000</pubDate>
+            <enclosure url="https://github.com/samatojr/notepad-app/releases/download/v3.2/Notepad_3.2.zip"
+                       sparkle:version="27"
+                       sparkle:shortVersionString="3.2"
+                       sparkle:edSignature="p2wlIdjmvuDLEwP0pq72yqoaqK+bkdDgAC2ig779F4fxQVzz+aj3Ub35dtGF8s+ksu0uXDL1yWFghyUigbfVBg=="
+                       length="4257107"
+                       type="application/octet-stream" />
+        </item>
+        <item>
             <title>3.1.9.4</title>
             <sparkle:version>26</sparkle:version>
             <sparkle:shortVersionString>3.1.9.4</sparkle:shortVersionString>
