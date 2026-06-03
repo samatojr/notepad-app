@@ -116,9 +116,9 @@ final class UpdateChecker {
         // Strip quarantine from the downloaded DMG so hdiutil can mount it cleanly.
         shell("/usr/bin/xattr", ["-d", "com.apple.quarantine", dmgURL.path])
 
-        // Mount silently.
+        // Mount — omit -quiet so hdiutil prints the mount point we need to parse.
         let mountOutput = shell("/usr/bin/hdiutil",
-                                ["attach", "-nobrowse", "-quiet", dmgURL.path])
+                                ["attach", "-nobrowse", dmgURL.path])
 
         // Find the mount point — hdiutil prints it as the last token on the last line.
         guard let mountPoint = mountOutput
@@ -182,10 +182,13 @@ final class UpdateChecker {
         NSWorkspace.shared.open(dmgURL)
         let alert = NSAlert.make()
         alert.messageText     = "Manual install needed"
-        alert.informativeText = "Drag Notepad from the installer window into Applications, then relaunch Notepad."
+        alert.informativeText = "Quit Notepad first, then drag Notepad from the installer window into Applications, and relaunch."
         alert.alertStyle      = .informational
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
+        alert.addButton(withTitle: "Quit Notepad")
+        alert.addButton(withTitle: "Later")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSApp.terminate(nil)
+        }
     }
 
     @discardableResult
