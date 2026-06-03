@@ -113,73 +113,82 @@ final class UpdateChecker {
     // MARK: - Automated install
 
     private func openDMGForInstall(dmgURL: URL, version: String) {
-        // Strip quarantine from the downloaded DMG so hdiutil can mount it cleanly.
-        shell("/usr/bin/xattr", ["-d", "com.apple.quarantine", dmgURL.path])
+        // Observe NSWorkspace for the DMG volume to mount — no hdiutil Process needed.
+        var observer: NSObjectProtocol?
+        var installed = false
 
-        // Mount — omit -quiet so hdiutil prints the mount point we need to parse.
-        let mountOutput = shell("/usr/bin/hdiutil",
-                                ["attach", "-nobrowse", dmgURL.path])
+        observer = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didMountNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notif in
+            guard let self,
+                  let volumeURL = notif.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
+            else { return }
 
-        // Find the mount point — hdiutil prints it as the last token on the last line.
-        guard let mountPoint = mountOutput
-                .components(separatedBy: "\n")
-                .last(where: { $0.contains("/Volumes/") })?
-                .components(separatedBy: "\t").last?
-                .trimmingCharacters(in: .whitespaces),
-              !mountPoint.isEmpty
-        else {
-            fallbackManualInstall(dmgURL: dmgURL, version: version); return
+            // Only act on a volume that contains our app.
+            let fm = FileManager.default
+            guard let appName = (try? fm.contentsOfDirectory(atPath: volumeURL.path))?
+                    .first(where: { $0.hasSuffix(".app") }),
+                  appName.lowercased().contains("notepad")
+            else { return }
+
+            if let obs = observer {
+                NSWorkspace.shared.notificationCenter.removeObserver(obs)
+                observer = nil
+            }
+            installed = true
+            self.installFromVolume(volumeURL: volumeURL, appName: appName, version: version)
         }
 
-        // Locate the .app inside the mounted volume.
-        let fm = FileManager.default
-        guard let appName = (try? fm.contentsOfDirectory(atPath: mountPoint))?
-                .first(where: { $0.hasSuffix(".app") })
-        else {
-            hdiutil_detach(mountPoint)
-            fallbackManualInstall(dmgURL: dmgURL, version: version); return
+        // Open the DMG — macOS mounts it and fires didMountNotification.
+        NSWorkspace.shared.open(dmgURL)
+
+        // Fallback: if the volume never mounts within 30 s, show manual instructions.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            if let obs = observer {
+                NSWorkspace.shared.notificationCenter.removeObserver(obs)
+                observer = nil
+            }
+            if !installed { self?.showManualFallback() }
         }
+    }
 
-        let sourceApp = URL(fileURLWithPath: mountPoint).appendingPathComponent(appName)
-
-        // Target: same folder the running app is in (usually /Applications).
+    private func installFromVolume(volumeURL: URL, appName: String, version: String) {
+        let fm          = FileManager.default
+        let sourceApp   = volumeURL.appendingPathComponent(appName)
         let runningApp  = URL(fileURLWithPath: Bundle.main.bundlePath)
-        let destination = runningApp.deletingLastPathComponent()
-                                    .appendingPathComponent(appName)
+        let destination = runningApp.deletingLastPathComponent().appendingPathComponent(appName)
 
         do {
-            // Replace the existing app bundle.
             _ = try fm.replaceItemAt(destination, withItemAt: sourceApp,
                                      backupItemName: nil,
                                      options: .usingNewMetadataOnly)
         } catch {
-            hdiutil_detach(mountPoint)
-            fallbackManualInstall(dmgURL: dmgURL, version: version); return
+            try? NSWorkspace.shared.unmountAndEjectDevice(at: volumeURL)
+            showManualFallback(); return
         }
 
-        // Strip quarantine from the freshly installed app.
+        // Strip quarantine from the installed app.
         shell("/usr/bin/xattr", ["-cr", destination.path])
 
-        hdiutil_detach(mountPoint)
+        try? NSWorkspace.shared.unmountAndEjectDevice(at: volumeURL)
 
-        // Prompt to relaunch.
         let alert = NSAlert.make()
-        alert.messageText    = "Notepad \(version) installed"
+        alert.messageText     = "Notepad \(version) installed"
         alert.informativeText = "Relaunch now to start using the new version."
-        alert.alertStyle = .informational
+        alert.alertStyle      = .informational
         alert.addButton(withTitle: "Relaunch")
         alert.addButton(withTitle: "Later")
         if alert.runModal() == .alertFirstButtonReturn {
             let cfg = NSWorkspace.OpenConfiguration()
             cfg.createsNewApplicationInstance = true
-            NSWorkspace.shared.openApplication(
-                at: destination, configuration: cfg) { _, _ in }
+            NSWorkspace.shared.openApplication(at: destination, configuration: cfg) { _, _ in }
             NSApp.terminate(nil)
         }
     }
 
-    private func fallbackManualInstall(dmgURL: URL, version: String) {
-        NSWorkspace.shared.open(dmgURL)
+    private func showManualFallback() {
         let alert = NSAlert.make()
         alert.messageText     = "Manual install needed"
         alert.informativeText = "Quit Notepad first, then drag Notepad from the installer window into Applications, and relaunch."
@@ -205,9 +214,6 @@ final class UpdateChecker {
                       encoding: .utf8) ?? ""
     }
 
-    private func hdiutil_detach(_ mountPoint: String) {
-        shell("/usr/bin/hdiutil", ["detach", mountPoint, "-quiet"])
-    }
 
     // MARK: - Helpers
 
