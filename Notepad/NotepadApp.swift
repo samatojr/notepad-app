@@ -184,6 +184,19 @@ extension Notification.Name {
     static let amatoPadModeChanged = Notification.Name("amatoPadModeChanged")
 }
 
+// MARK: - About
+
+private func showAbout() {
+    let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    let alert   = NSAlert.make()
+    alert.messageText    = "Notepad"
+    alert.informativeText = "Version \(version)\n\nA fast, clean text editor for macOS."
+    alert.alertStyle     = .informational
+    if let icon = NSApp.applicationIconImage { alert.icon = icon }
+    alert.addButton(withTitle: "OK")
+    alert.runModal()
+}
+
 // MARK: - NSAlert helper
 
 extension NSAlert {
@@ -258,6 +271,8 @@ struct NotepadCommands: Commands {
         }
 
         CommandGroup(replacing: .appInfo) {
+            Button("About Notepad") { showAbout() }
+            Divider()
             Button("Check for Updates…") { UpdateChecker.shared.checkNow() }
             Divider()
         }

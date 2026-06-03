@@ -7,6 +7,7 @@ import AppKit
 /// onto the editor opens it rather than inserting its path as text.
 private final class NotepadTextView: NSTextView {
     var onFileDrop: ((URL) -> Void)?
+    var onAutoGrid: ((Character) -> Void)?
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         if sender.draggingPasteboard.canReadObject(
@@ -36,11 +37,40 @@ private final class NotepadTextView: NSTextView {
     }
 
     /// Strip all formatting on paste — insert plain text only.
+    /// After inserting, checks whether the full document now looks like a
+    /// TSV grid (≥5 rows, ≥2 columns, ≥80% consistent column count) and,
+    /// if so, fires onAutoGrid so the coordinator can switch to table view.
     override func paste(_ sender: Any?) {
         let pb = NSPasteboard.general
-        if let plain = pb.string(forType: .string) {
-            insertText(plain, replacementRange: selectedRange())
+        guard let plain = pb.string(forType: .string) else { return }
+
+        // Only auto-switch when the paste covers the entire document.
+        let totalLen = (string as NSString).length
+        let sel = selectedRange()
+        let coversAll = sel.length == totalLen || totalLen == 0
+
+        insertText(plain, replacementRange: sel)
+
+        if coversAll, let delim = tsvGridDelimiter(string) {
+            onAutoGrid?(delim)
         }
+    }
+
+    /// Returns the detected delimiter if `text` looks like a well-formed grid:
+    /// ≥5 rows, ≥2 columns, ≥80% of rows share the modal column count.
+    private func tsvGridDelimiter(_ text: String) -> Character? {
+        let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }
+        guard lines.count >= 5 else { return nil }
+
+        for delim: Character in ["\t", ","] {
+            let counts = lines.map { $0.components(separatedBy: String(delim)).count }
+            guard let modal = counts.max(), modal >= 2 else { continue }
+            let matching = counts.filter { $0 == modal }.count
+            if Double(matching) / Double(lines.count) >= 0.8 {
+                return delim
+            }
+        }
+        return nil
     }
 
 }
@@ -84,6 +114,9 @@ struct NotepadEditorView: NSViewRepresentable {
         // Wire file drop handler
         textView.onFileDrop = { [weak coord = context.coordinator] url in
             coord?.document?.loadFile(from: url)
+        }
+        textView.onAutoGrid = { [weak coord = context.coordinator] delim in
+            coord?.document?.forceGridView(delimiter: delim)
         }
 
         textView.delegate    = context.coordinator

@@ -34,12 +34,21 @@ final class CopyableTableView: NSTableView {
     @objc func copy(_ sender: Any?)  { copyHandler?() }
     @objc func paste(_ sender: Any?) { pasteHandler?() }
 
-    /// Track which data column was clicked so paste knows where to anchor.
+    /// Explicitly enable Copy and Paste menu items when this view is first responder.
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(copy(_:))  { return copyHandler  != nil }
+        if item.action == #selector(paste(_:)) { return pasteHandler != nil }
+        return super.validateUserInterfaceItem(item)
+    }
+
+    /// Track which data column was clicked BEFORE super processes the event,
+    /// since clickedColumn is reset to -1 after super.mouseDown completes.
     override func mouseDown(with event: NSEvent) {
+        let point  = convert(event.locationInWindow, from: nil)
+        let colIdx = column(at: point)
         super.mouseDown(with: event)
-        let col = clickedColumn
-        guard col >= 0, col < tableColumns.count else { return }
-        let id = tableColumns[col].identifier.rawValue
+        guard colIdx >= 0, colIdx < tableColumns.count else { return }
+        let id = tableColumns[colIdx].identifier.rawValue
         guard id != "col_rownum",
               let last = id.split(separator: "_").last,
               let idx  = Int(last) else { return }
@@ -52,16 +61,29 @@ final class CopyableTableView: NSTableView {
         if row >= 0 && !selectedRowIndexes.contains(row) {
             selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
-        guard !selectedRowIndexes.isEmpty else { return nil }
 
-        let menu  = NSMenu()
-        let count = selectedRowIndexes.count
-        let label = count == 1 ? "Delete Row" : "Delete \(count) Rows"
-        let item  = NSMenuItem(title: label, action: #selector(deleteRows(_:)),
-                               keyEquivalent: "")
-        item.target = self
-        menu.addItem(item)
-        return menu
+        let menu = NSMenu()
+
+        // Paste grid — shown whenever there's string content on the clipboard
+        if NSPasteboard.general.string(forType: .string) != nil {
+            let pasteItem = NSMenuItem(title: "Paste", action: #selector(paste(_:)),
+                                       keyEquivalent: "")
+            pasteItem.target = self
+            menu.addItem(pasteItem)
+        }
+
+        // Delete rows — only when rows are selected
+        if !selectedRowIndexes.isEmpty {
+            if menu.items.count > 0 { menu.addItem(.separator()) }
+            let count = selectedRowIndexes.count
+            let label = count == 1 ? "Delete Row" : "Delete \(count) Rows"
+            let del   = NSMenuItem(title: label, action: #selector(deleteRows(_:)),
+                                   keyEquivalent: "")
+            del.target = self
+            menu.addItem(del)
+        }
+
+        return menu.items.isEmpty ? nil : menu
     }
 
     @objc private func deleteRows(_ sender: Any?) { deleteHandler?() }
@@ -105,6 +127,7 @@ struct CSVTableView: NSViewRepresentable {
 
         coord.tableView  = dataTable
         coord.dataScroll = scrollView
+        coord.installKeyMonitor()
         coord.rebuildColumns()
         coord.applyPaperTheme(AppPreferences.shared.paperTheme)
         coord.startObserving()
@@ -136,6 +159,10 @@ struct CSVTableView: NSViewRepresentable {
         private var lastShowRowNumbers: Bool = false
         private var lastShowHeaders:    Bool = true
         private var lastSortKeys:       [CSVSortKey] = []
+
+        // Local key monitor for ⌘V — bypasses AppKit's menu key-equivalent
+        // interception so paste reaches us before the Edit menu consumes it.
+        private var keyMonitor: Any?
 
         // MARK: Helpers
 
@@ -389,6 +416,30 @@ struct CSVTableView: NSViewRepresentable {
 
         // MARK: Paper Theme
 
+        // MARK: Key monitor
+
+        func installKeyMonitor() {
+            guard keyMonitor == nil else { return }
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self,
+                      event.modifierFlags.contains(.command),
+                      event.charactersIgnoringModifiers == "v",
+                      self.document?.csvIsTableView == true
+                else { return event }
+
+                // Don't intercept if a cell text field is being edited
+                let fr = NSApp.keyWindow?.firstResponder
+                if fr is NSText || fr is NSTextField { return event }
+
+                self.pasteFromClipboard()
+                return nil   // consume — prevent the event reaching the Edit menu
+            }
+        }
+
+        deinit {
+            if let m = keyMonitor { NSEvent.removeMonitor(m) }
+        }
+
         func applyPaperTheme(_ theme: PaperTheme) {
             dataScroll?.appearance      = theme.nsAppearance
             dataScroll?.backgroundColor = theme.paperColor
@@ -439,8 +490,8 @@ struct CSVTableView: NSViewRepresentable {
         func pasteFromClipboard() {
             guard let dt    = tableView,
                   let doc   = document,
-                  let delim = doc.csvDelimiter,
-                  let clip  = NSPasteboard.general.string(forType: .string),
+                  let delim = doc.csvDelimiter else { return }
+            guard let clip  = NSPasteboard.general.string(forType: .string),
                   !clip.isEmpty else { return }
 
             // Parse clipboard as a TSV grid (Google Sheets copies tab-separated rows).

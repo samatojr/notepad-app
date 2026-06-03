@@ -56,7 +56,7 @@ final class UpdateChecker {
         } else if userInitiated {
             let alert = NSAlert.make()
             alert.messageText = "Notepad is up to date"
-            alert.informativeText = "You're running version \(appVersion()) (build \(currentBuild))."
+            alert.informativeText = "You're running version \(appVersion())."
             alert.alertStyle = .informational
             alert.addButton(withTitle: "OK")
             alert.runModal()
@@ -110,22 +110,100 @@ final class UpdateChecker {
         }.resume()
     }
 
-    // MARK: - Open DMG for install
+    // MARK: - Automated install
 
     private func openDMGForInstall(dmgURL: URL, version: String) {
-        // Open the DMG with NSWorkspace — macOS mounts it and shows the Finder
-        // installer window. Simpler and more reliable than mounting via hdiutil.
-        NSWorkspace.shared.open(dmgURL)
+        // Strip quarantine from the downloaded DMG so hdiutil can mount it cleanly.
+        shell("/usr/bin/xattr", ["-d", "com.apple.quarantine", dmgURL.path])
 
+        // Mount silently.
+        let mountOutput = shell("/usr/bin/hdiutil",
+                                ["attach", "-nobrowse", "-quiet", dmgURL.path])
+
+        // Find the mount point — hdiutil prints it as the last token on the last line.
+        guard let mountPoint = mountOutput
+                .components(separatedBy: "\n")
+                .last(where: { $0.contains("/Volumes/") })?
+                .components(separatedBy: "\t").last?
+                .trimmingCharacters(in: .whitespaces),
+              !mountPoint.isEmpty
+        else {
+            fallbackManualInstall(dmgURL: dmgURL, version: version); return
+        }
+
+        // Locate the .app inside the mounted volume.
+        let fm = FileManager.default
+        guard let appName = (try? fm.contentsOfDirectory(atPath: mountPoint))?
+                .first(where: { $0.hasSuffix(".app") })
+        else {
+            hdiutil_detach(mountPoint)
+            fallbackManualInstall(dmgURL: dmgURL, version: version); return
+        }
+
+        let sourceApp = URL(fileURLWithPath: mountPoint).appendingPathComponent(appName)
+
+        // Target: same folder the running app is in (usually /Applications).
+        let runningApp  = URL(fileURLWithPath: Bundle.main.bundlePath)
+        let destination = runningApp.deletingLastPathComponent()
+                                    .appendingPathComponent(appName)
+
+        do {
+            // Replace the existing app bundle.
+            _ = try fm.replaceItemAt(destination, withItemAt: sourceApp,
+                                     backupItemName: nil,
+                                     options: .usingNewMetadataOnly)
+        } catch {
+            hdiutil_detach(mountPoint)
+            fallbackManualInstall(dmgURL: dmgURL, version: version); return
+        }
+
+        // Strip quarantine from the freshly installed app.
+        shell("/usr/bin/xattr", ["-cr", destination.path])
+
+        hdiutil_detach(mountPoint)
+
+        // Prompt to relaunch.
         let alert = NSAlert.make()
-        alert.messageText = "Notepad \(version) is ready to install"
-        alert.informativeText = "Drag Notepad from the installer window into your Applications folder, then relaunch."
+        alert.messageText    = "Notepad \(version) installed"
+        alert.informativeText = "Relaunch now to start using the new version."
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "Quit Notepad")
+        alert.addButton(withTitle: "Relaunch")
         alert.addButton(withTitle: "Later")
         if alert.runModal() == .alertFirstButtonReturn {
+            let cfg = NSWorkspace.OpenConfiguration()
+            cfg.createsNewApplicationInstance = true
+            NSWorkspace.shared.openApplication(
+                at: destination, configuration: cfg) { _, _ in }
             NSApp.terminate(nil)
         }
+    }
+
+    private func fallbackManualInstall(dmgURL: URL, version: String) {
+        NSWorkspace.shared.open(dmgURL)
+        let alert = NSAlert.make()
+        alert.messageText     = "Manual install needed"
+        alert.informativeText = "Drag Notepad from the installer window into Applications, then relaunch Notepad."
+        alert.alertStyle      = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    @discardableResult
+    private func shell(_ path: String, _ args: [String]) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: path)
+        proc.arguments = args
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError  = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+        return String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                      encoding: .utf8) ?? ""
+    }
+
+    private func hdiutil_detach(_ mountPoint: String) {
+        shell("/usr/bin/hdiutil", ["detach", mountPoint, "-quiet"])
     }
 
     // MARK: - Helpers
