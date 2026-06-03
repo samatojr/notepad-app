@@ -96,107 +96,64 @@ final class UpdateChecker {
                 if let error { self.showError(error.localizedDescription); return }
                 guard let tempURL else { self.showError("Download failed."); return }
 
-                // Move to a stable path with .dmg extension before opening
-                let dest = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("NotepadUpdate-\(UUID().uuidString).dmg")
+                // Move to stable path
+                let zipPath = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("NotepadUpdate-\(UUID().uuidString).zip")
                 do {
-                    try FileManager.default.moveItem(at: tempURL, to: dest)
+                    try FileManager.default.moveItem(at: tempURL, to: zipPath)
                 } catch {
                     self.showError("Could not save the downloaded update: \(error.localizedDescription)")
                     return
                 }
-                self.openDMGForInstall(dmgURL: dest, version: info.version)
+                self.installFromZip(zipPath: zipPath, version: info.version)
             }
         }.resume()
     }
 
-    // MARK: - Automated install
+    // MARK: - Automated install from zip
 
-    private func openDMGForInstall(dmgURL: URL, version: String) {
-        // Observe NSWorkspace for the DMG volume to mount — no hdiutil Process needed.
-        var observer: NSObjectProtocol?
-        var installed = false
-
-        observer = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didMountNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] notif in
-            guard let self,
-                  let volumeURL = notif.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
-            else { return }
-
-            // Only act on a volume that contains our app.
-            let fm = FileManager.default
-            guard let appName = (try? fm.contentsOfDirectory(atPath: volumeURL.path))?
-                    .first(where: { $0.hasSuffix(".app") }),
-                  appName.lowercased().contains("notepad")
-            else { return }
-
-            if let obs = observer {
-                NSWorkspace.shared.notificationCenter.removeObserver(obs)
-                observer = nil
-            }
-            installed = true
-            self.installFromVolume(volumeURL: volumeURL, appName: appName, version: version)
-        }
-
-        // Open the DMG — macOS mounts it and fires didMountNotification.
-        NSWorkspace.shared.open(dmgURL)
-
-        // Fallback: if the volume never mounts within 30 s, show manual instructions.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-            if let obs = observer {
-                NSWorkspace.shared.notificationCenter.removeObserver(obs)
-                observer = nil
-            }
-            if !installed { self?.showManualFallback() }
-        }
-    }
-
-    private func installFromVolume(volumeURL: URL, appName: String, version: String) {
-        let fm          = FileManager.default
-        let sourceApp   = volumeURL.appendingPathComponent(appName)
-        let runningApp  = URL(fileURLWithPath: Bundle.main.bundlePath)
-        let destination = runningApp.deletingLastPathComponent().appendingPathComponent(appName)
+    private func installFromZip(zipPath: URL, version: String) {
+        let fm = FileManager.default
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("NotepadExtract-\(UUID().uuidString)")
 
         do {
-            _ = try fm.replaceItemAt(destination, withItemAt: sourceApp,
-                                     backupItemName: nil,
-                                     options: .usingNewMetadataOnly)
+            // Extract zip
+            try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            shell("/usr/bin/unzip", ["-q", zipPath.path, "-d", tempDir.path])
+
+            // Find the app
+            guard let appName = (try? fm.contentsOfDirectory(atPath: tempDir.path))?
+                    .first(where: { $0.hasSuffix(".app") })
+            else { throw NSError(domain: "Extract", code: 1) }
+
+            let sourceApp = tempDir.appendingPathComponent(appName)
+            let destination = URL(fileURLWithPath: Bundle.main.bundlePath)
+                .deletingLastPathComponent()
+                .appendingPathComponent(appName)
+
+            // Quit this app
+            NSApp.terminate(nil)
+
+            // Replace the app (runs after quit)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                do {
+                    _ = try fm.replaceItemAt(destination, withItemAt: sourceApp,
+                                             backupItemName: nil,
+                                             options: .usingNewMetadataOnly)
+                    // Relaunch new version
+                    let cfg = NSWorkspace.OpenConfiguration()
+                    cfg.createsNewApplicationInstance = true
+                    NSWorkspace.shared.openApplication(at: destination, configuration: cfg) { _, _ in }
+                } catch {
+                    // Cleanup
+                    try? fm.removeItem(at: tempDir)
+                    try? fm.removeItem(at: zipPath)
+                }
+            }
         } catch {
-            try? NSWorkspace.shared.unmountAndEjectDevice(at: volumeURL)
-            showManualFallback(); return
-        }
-
-        // Strip quarantine from the installed app.
-        shell("/usr/bin/xattr", ["-cr", destination.path])
-
-        try? NSWorkspace.shared.unmountAndEjectDevice(at: volumeURL)
-
-        let alert = NSAlert.make()
-        alert.messageText     = "Notepad \(version) installed"
-        alert.informativeText = "Relaunch now to start using the new version."
-        alert.alertStyle      = .informational
-        alert.addButton(withTitle: "Relaunch")
-        alert.addButton(withTitle: "Later")
-        if alert.runModal() == .alertFirstButtonReturn {
-            let cfg = NSWorkspace.OpenConfiguration()
-            cfg.createsNewApplicationInstance = true
-            NSWorkspace.shared.openApplication(at: destination, configuration: cfg) { _, _ in }
-            NSApp.terminate(nil)
-        }
-    }
-
-    private func showManualFallback() {
-        let alert = NSAlert.make()
-        alert.messageText     = "Manual install needed"
-        alert.informativeText = "Quit Notepad first, then drag Notepad from the installer window into Applications, and relaunch."
-        alert.alertStyle      = .informational
-        alert.addButton(withTitle: "Quit Notepad")
-        alert.addButton(withTitle: "Later")
-        if alert.runModal() == .alertFirstButtonReturn {
-            NSApp.terminate(nil)
+            try? fm.removeItem(at: tempDir)
+            try? fm.removeItem(at: zipPath)
+            showError("Update failed: \(error.localizedDescription)")
         }
     }
 
