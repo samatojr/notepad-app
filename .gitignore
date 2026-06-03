@@ -16,3 +16,4 @@ build/
 # macOS
 .DS_Store
 *.swp
+sparkle_private_key*.txt

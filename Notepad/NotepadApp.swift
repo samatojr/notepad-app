@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import Combine
+import Sparkle
 
 // MARK: - App Delegate
 
@@ -22,8 +24,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
             object: nil
         )
-        // Background update check — only shows UI if a newer build is available
-        UpdateChecker.shared.checkOnLaunch()
+        // Automatic update checks are handled by Sparkle (SPUStandardUpdaterController,
+        // started in NotepadApp.init with startingUpdater: true).
         // EASTER EGG: observe the toggle notification fired when user types "amatopad" in Find.
         // To remove: delete this addObserver call and the handleAmatoPadToggle method below.
         NotificationCenter.default.addObserver(
@@ -158,9 +160,18 @@ struct NotepadApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @ObservedObject private var recents = RecentFilesManager.shared
 
+    // Sparkle updater. startingUpdater: true begins the automatic background
+    // update schedule (checks the appcast feed on its own cadence).
+    private let updaterController: SPUStandardUpdaterController
+
     init() {
         SessionManager.shared.loadAndEnqueue()
         SessionManager.shared.clearClosedTabs()
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
     }
 
     var body: some Scene {
@@ -168,8 +179,36 @@ struct NotepadApp: App {
             ContentView()
         }
         .commands {
-            NotepadCommands(recents: recents)
+            NotepadCommands(recents: recents, updater: updaterController.updater)
         }
+    }
+}
+
+// MARK: - Sparkle "Check for Updates" menu wiring (official SwiftUI pattern)
+
+/// Publishes whether the updater can currently check (disabled mid-check).
+final class CheckForUpdatesViewModel: ObservableObject {
+    @Published var canCheckForUpdates = false
+
+    init(updater: SPUUpdater) {
+        updater.publisher(for: \.canCheckForUpdates)
+            .assign(to: &$canCheckForUpdates)
+    }
+}
+
+/// The "Check for Updates…" menu item, bound to Sparkle's updater.
+struct CheckForUpdatesView: View {
+    @ObservedObject private var viewModel: CheckForUpdatesViewModel
+    private let updater: SPUUpdater
+
+    init(updater: SPUUpdater) {
+        self.updater = updater
+        self.viewModel = CheckForUpdatesViewModel(updater: updater)
+    }
+
+    var body: some View {
+        Button("Check for Updates…", action: updater.checkForUpdates)
+            .disabled(!viewModel.canCheckForUpdates)
     }
 }
 
@@ -224,6 +263,7 @@ extension FocusedValues {
 struct NotepadCommands: Commands {
     @FocusedValue(\.notepadDocument) private var document: NotepadDocument?
     @ObservedObject var recents: RecentFilesManager
+    let updater: SPUUpdater
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -273,7 +313,7 @@ struct NotepadCommands: Commands {
         CommandGroup(replacing: .appInfo) {
             Button("About Notepad") { showAbout() }
             Divider()
-            Button("Check for Updates…") { UpdateChecker.shared.checkNow() }
+            CheckForUpdatesView(updater: updater)
             Divider()
         }
 

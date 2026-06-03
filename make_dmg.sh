@@ -45,7 +45,10 @@ VOL_ACTUAL=$(basename "$MOUNT_POINT")
 
 # ── 4. Populate (background image goes in a VISIBLE folder first) ─────────────
 echo "→ Copying files…"
-cp -r "$APP"   "$MOUNT_POINT/Notepad.app"
+# Use ditto (not cp -r) to preserve framework version symlinks and code
+# signatures intact — cp -r flattens symlinks and corrupts embedded
+# frameworks like Sparkle.framework, invalidating notarization.
+ditto "$APP"   "$MOUNT_POINT/Notepad.app"
 ln -s /Applications "$MOUNT_POINT/Applications"
 mkdir -p "$MOUNT_POINT/dmgbg"
 cp "$BG_PNG"   "$MOUNT_POINT/dmgbg/background.png"

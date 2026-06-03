@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+    <channel>
+        <title>Notepad</title>
+        <link>https://raw.githubusercontent.com/samatojr/notepad-app/main/appcast.xml</link>
+        <description>Updates for Notepad</description>
+        <language>en</language>
+        <item>
+            <title>3.1.9.3</title>
+            <sparkle:version>25</sparkle:version>
+            <sparkle:shortVersionString>3.1.9.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[
+                <ul>
+                    <li>New automatic update system (Sparkle) — updates now install seamlessly.</li>
+                    <li>Paste from Google Sheets auto-switches to grid mode.</li>
+                </ul>
+            ]]></description>
+            <pubDate>Wed, 03 Jun 2026 23:24:33 +0000</pubDate>
+            <enclosure url="https://github.com/samatojr/notepad-app/releases/download/v3.1.9.3/Notepad_3.1.9.3.zip"
+                       sparkle:version="25"
+                       sparkle:shortVersionString="3.1.9.3"
+                       sparkle:edSignature="9BOG0mZYLNIVGnoohtxt0xbMcK/Fh9KELyzaXKCqbLP81oh3twxWum90CUchsvHQTeXBsbcyywKSh6O142tZDA=="
+                       length="4257112"
+                       type="application/octet-stream" />
+        </item>
+    </channel>
+</rss>

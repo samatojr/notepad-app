@@ -81,14 +81,18 @@
 	<key>CFBundlePackageType</key>
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
-	<string>3.1.9.2</string>
+	<string>3.1.9.3</string>
 	<key>CFBundleVersion</key>
-	<string>24</string>
+	<string>25</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/samatojr/notepad-app/main/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>9h/AUxAAd1Ke5HpMgO3PJ8vu6HdbEOm40Godql4fAuU=</string>
 </dict>
 </plist>

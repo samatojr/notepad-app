@@ -100,7 +100,8 @@
       "Bash(codesign -dv --verbose=4 ~/Desktop/Notepad_2.3_export/Notepad.app)",
       "Bash(ditto -c -k --keepParent ~/Desktop/Notepad_2.3_export/Notepad.app ~/Desktop/Notepad_2.3.zip)",
       "Bash(spctl --assess --type execute --verbose ~/Desktop/Notepad_2.3_export/Notepad.app)",
-      "Bash(cat ~/.claude/settings.json 2>/dev/null || echo \"\\(file not found\\)\")"
+      "Bash(cat ~/.claude/settings.json 2>/dev/null || echo \"\\(file not found\\)\")",
+      "WebFetch(domain:sparkle-project.org)"
     ]
   }
 }
