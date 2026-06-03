@@ -12,22 +12,39 @@ final class CSVEditableField: NSTextField {
     }
 }
 
-// MARK: - NSTableView subclass for ⌘C copy + right-click menu
+// MARK: - NSTableView subclass for ⌘C copy, ⌘V paste, right-click menu
 
 final class CopyableTableView: NSTableView {
     var copyHandler:   (() -> Void)?
+    var pasteHandler:  (() -> Void)?
     var deleteHandler: (() -> Void)?
 
+    /// Tracks the last data column index the user clicked — used as the paste anchor column.
+    private(set) var lastClickedDataColumn: Int = 0
+
     override func keyDown(with event: NSEvent) {
-        if event.modifierFlags.contains(.command),
-           event.charactersIgnoringModifiers == "c" {
-            copyHandler?()
-        } else {
-            super.keyDown(with: event)
+        guard event.modifierFlags.contains(.command) else { super.keyDown(with: event); return }
+        switch event.charactersIgnoringModifiers {
+        case "c": copyHandler?()
+        case "v": pasteHandler?()
+        default:  super.keyDown(with: event)
         }
     }
 
-    @objc func copy(_ sender: Any?) { copyHandler?() }
+    @objc func copy(_ sender: Any?)  { copyHandler?() }
+    @objc func paste(_ sender: Any?) { pasteHandler?() }
+
+    /// Track which data column was clicked so paste knows where to anchor.
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        let col = clickedColumn
+        guard col >= 0, col < tableColumns.count else { return }
+        let id = tableColumns[col].identifier.rawValue
+        guard id != "col_rownum",
+              let last = id.split(separator: "_").last,
+              let idx  = Int(last) else { return }
+        lastClickedDataColumn = idx
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let point = convert(event.locationInWindow, from: nil)
@@ -76,6 +93,7 @@ struct CSVTableView: NSViewRepresentable {
         dataTable.dataSource                         = coord
         dataTable.columnAutoresizingStyle            = .noColumnAutoresizing
         dataTable.copyHandler   = { [weak coord] in coord?.copySelectedRows() }
+        dataTable.pasteHandler  = { [weak coord] in coord?.pasteFromClipboard() }
         dataTable.deleteHandler = { [weak coord] in coord?.deleteSelectedRows() }
 
         let scrollView = NSScrollView()
@@ -397,9 +415,8 @@ struct CSVTableView: NSViewRepresentable {
         // MARK: Copy
 
         func copySelectedRows() {
-            guard let dt    = tableView,
-                  let doc   = document,
-                  let delim = doc.csvDelimiter else { return }
+            guard let dt  = tableView,
+                  let doc = document else { return }
 
             let selected = dt.selectedRowIndexes
             guard !selected.isEmpty else { return }
@@ -409,9 +426,68 @@ struct CSVTableView: NSViewRepresentable {
                 return doc.csvRows[displayOrder[displayRow]]
             }
 
-            let csv = serializeDelimited(rows, delimiter: delim)
+            // Always write TSV regardless of the file's native delimiter —
+            // Google Sheets (and most spreadsheet apps) split on tabs, not commas.
+            // The native file format is preserved in doc.text; this only affects the clipboard.
+            let tsv = serializeDelimited(rows, delimiter: "\t")
             NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(csv, forType: .string)
+            NSPasteboard.general.setString(tsv, forType: .string)
+        }
+
+        // MARK: Paste (Google Sheets / TSV grid detection)
+
+        func pasteFromClipboard() {
+            guard let dt    = tableView,
+                  let doc   = document,
+                  let delim = doc.csvDelimiter,
+                  let clip  = NSPasteboard.general.string(forType: .string),
+                  !clip.isEmpty else { return }
+
+            // Parse clipboard as a TSV grid (Google Sheets copies tab-separated rows).
+            // Falls back gracefully to a single value if no tabs/newlines are present.
+            let clipGrid = parseClipboardGrid(clip)
+            guard !clipGrid.isEmpty else { return }
+
+            // Anchor: top-left of the current row selection + last clicked column.
+            let anchorDisplayRow = dt.selectedRowIndexes.min() ?? 0
+            let anchorCol        = dt.lastClickedDataColumn
+
+            guard displayOrder.indices.contains(anchorDisplayRow) else { return }
+
+            var changed = false
+            for (rowOffset, pasteRow) in clipGrid.enumerated() {
+                let targetDisplay = anchorDisplayRow + rowOffset
+                guard displayOrder.indices.contains(targetDisplay) else { break }
+                let csvIdx = displayOrder[targetDisplay]
+
+                for (colOffset, value) in pasteRow.enumerated() {
+                    let targetCol = anchorCol + colOffset
+                    guard targetCol < doc.csvRows[csvIdx].cells.count else { continue }
+                    doc.csvRows[csvIdx].cells[targetCol] = value
+                    changed = true
+                }
+            }
+
+            guard changed else { return }
+            doc.text       = serializeDelimited(doc.csvRows, delimiter: delim)
+            doc.isModified = true
+            dt.reloadData()
+        }
+
+        /// Parses a TSV/CSV clipboard string into a 2-D grid of strings.
+        /// Handles \r\n and \n line endings; auto-detects tabs vs commas.
+        private func parseClipboardGrid(_ text: String) -> [[String]] {
+            // Normalise line endings
+            let normalised = text.replacingOccurrences(of: "\r\n", with: "\n")
+                                 .replacingOccurrences(of: "\r",   with: "\n")
+            var lines = normalised.components(separatedBy: "\n")
+            // Drop trailing empty line left by a trailing newline
+            if lines.last?.isEmpty == true { lines.removeLast() }
+            guard !lines.isEmpty else { return [] }
+
+            // Auto-detect delimiter: prefer tab (Google Sheets default), fall back to comma
+            let sep: String = lines[0].contains("\t") ? "\t" : ","
+            return lines.map { $0.components(separatedBy: sep) }
         }
 
         // MARK: NSTableViewDataSource
