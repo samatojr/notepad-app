@@ -6,6 +6,31 @@
         <description>Updates for Notepad</description>
         <language>en</language>
         <item>
+            <title>3.3</title>
+            <sparkle:version>28</sparkle:version>
+            <sparkle:shortVersionString>3.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[
+                <ul>
+                    <li>Fixed a CSV bug where a quote or inch mark (5" pipe) merged rows and could corrupt the file on save.</li>
+                    <li>Quitting with unsaved changes now prompts to save instead of discarding them.</li>
+                    <li>CSV and TSV files now open from Finder, and opening a file no longer silently does nothing.</li>
+                    <li>Launch no longer opens several blank windows.</li>
+                    <li>Paste from Google Sheets now grows the grid instead of dropping extra rows.</li>
+                    <li>Save As keeps the file's own extension instead of forcing .txt.</li>
+                    <li>Restored tabs come back in the order you left them.</li>
+                    <li>Faster typing in large JSON and other big files.</li>
+                </ul>
+            ]]></description>
+            <pubDate>Wed, 02 Sep 2026 12:18:38 +0000</pubDate>
+            <enclosure url="https://github.com/samatojr/notepad-app/releases/download/v3.3/Notepad_3.3.zip"
+                       sparkle:version="28"
+                       sparkle:shortVersionString="3.3"
+                       sparkle:edSignature="XHtxDeeiErBIO4F0lMWaM400QUXax4MklBadoT9Y27B+qeItT7RBxAGTRZDgmp/XSompyLONv3wUUNB0IMoODg=="
+                       length="4131454"
+                       type="application/octet-stream" />
+        </item>
+        <item>
             <title>3.2</title>
             <sparkle:version>27</sparkle:version>
             <sparkle:shortVersionString>3.2</sparkle:shortVersionString>

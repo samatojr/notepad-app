@@ -23,6 +23,13 @@ struct DocumentSessionState: Codable {
     var csvDelimiter: String?         // "," or "\t"; nil = not a tabular file
     var csvIsTableView: Bool?         // nil = not applicable
     var csvSortKeys: [CSVSortKey]?    // nil / empty = unsorted
+
+    /// An untitled document with no text has nothing to restore — it comes back as a
+    /// blank "Untitled" window. Recording those means a quit persists whatever blank
+    /// windows happened to be open, and the next launch faithfully reopens them all.
+    var isWorthRestoring: Bool {
+        bookmarkData != nil || !(unsavedText ?? "").isEmpty
+    }
 }
 
 // MARK: - Session Manager
@@ -38,7 +45,11 @@ final class SessionManager {
         guard let data = UserDefaults.standard.data(forKey: key),
               let states = try? JSONDecoder().decode([DocumentSessionState].self, from: data)
         else { return }
-        pending = states.sorted { $0.windowIndex < $1.windowIndex }
+        // Filter on the way in as well as on the way out: sessions written by builds
+        // before this filter existed still hold blank entries, and each one would
+        // reopen as an empty window.
+        pending = states.filter(\.isWorthRestoring)
+                        .sorted { $0.windowIndex < $1.windowIndex }
     }
 
     func popPending() -> DocumentSessionState? {
@@ -54,8 +65,12 @@ final class SessionManager {
         clearClosedTabs()
     }
 
+    /// Persists the session, dropping documents that aren't worth restoring. Every
+    /// entry saved here reopens as a window on the next launch, so blank untitled
+    /// documents must not be recorded — see `isWorthRestoring`.
     func save(states: [DocumentSessionState]) {
-        guard let data = try? JSONEncoder().encode(states) else { return }
+        let worthKeeping = states.filter(\.isWorthRestoring)
+        guard let data = try? JSONEncoder().encode(worthKeeping) else { return }
         UserDefaults.standard.set(data, forKey: key)
     }
 
@@ -132,6 +147,41 @@ final class PendingURLManager {
     static let shared = PendingURLManager()
     private init() {}
     var pendingURL: URL?
+
+    /// Open-file broadcasts already taken by a window. ContentView cannot reliably
+    /// identify "the active window" by comparing NSApp.keyWindow to its own window
+    /// (they often differ, and a window may never capture its own reference), so
+    /// each broadcast carries a token and the first view to claim it handles the
+    /// file. Guarantees exactly one open, and that it is never silently dropped.
+    private var claimedTokens: Set<UUID> = []
+
+    func claim(_ token: UUID) -> Bool {
+        guard !claimedTokens.contains(token) else { return false }
+        claimedTokens.insert(token)
+        if claimedTokens.count > 64 { claimedTokens.removeAll() }
+        return true
+    }
+}
+
+// MARK: - Session Tab Claims
+
+/// One-shot tokens for the session-restore broadcast, so exactly one window acts on
+/// each one. ContentView cannot pick "the active window" by comparing NSApp.keyWindow
+/// to its own window — at launch the key window is routinely some other window, and
+/// the guard silently dropped every restore notification, leaving the session short by
+/// however many tabs it missed. Same approach PendingURLManager uses for file opens.
+final class SessionTabClaims {
+    static let shared = SessionTabClaims()
+    private init() {}
+
+    private var claimedTokens: Set<UUID> = []
+
+    func claim(_ token: UUID) -> Bool {
+        guard !claimedTokens.contains(token) else { return false }
+        claimedTokens.insert(token)
+        if claimedTokens.count > 64 { claimedTokens.removeAll() }
+        return true
+    }
 }
 
 // MARK: - Recent Files Manager

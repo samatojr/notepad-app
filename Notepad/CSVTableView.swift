@@ -289,9 +289,15 @@ struct CSVTableView: NSViewRepresentable {
                   displayOrder.indices.contains(tableRow) else { return }
 
             let csvIdx = displayOrder[tableRow]
-            guard csvIdx < doc.csvRows.count,
-                  colIdx < doc.csvRows[csvIdx].cells.count,
-                  doc.csvRows[csvIdx].cells[colIdx] != value else { return }
+            guard csvIdx < doc.csvRows.count else { return }
+
+            // Ragged rows are legal CSV. Pad short rows so their trailing cells stay
+            // editable instead of silently swallowing the edit.
+            if colIdx >= doc.csvRows[csvIdx].cells.count {
+                doc.csvRows[csvIdx].cells.append(contentsOf: Array(
+                    repeating: "", count: colIdx - doc.csvRows[csvIdx].cells.count + 1))
+            }
+            guard doc.csvRows[csvIdx].cells[colIdx] != value else { return }
 
             doc.csvRows[csvIdx].cells[colIdx] = value
             doc.text       = serializeDelimited(doc.csvRows, delimiter: delim)
@@ -424,7 +430,11 @@ struct CSVTableView: NSViewRepresentable {
                 guard let self,
                       event.modifierFlags.contains(.command),
                       event.charactersIgnoringModifiers == "v",
-                      self.document?.csvIsTableView == true
+                      self.document?.csvIsTableView == true,
+                      // Every open CSV tab installs one of these monitors, so without
+                      // a key-window check the paste could land in a background tab's
+                      // document. Only the grid the user is looking at may claim ⌘V.
+                      self.tableView?.window?.isKeyWindow == true
                 else { return event }
 
                 // Don't intercept if a cell text field is being edited
@@ -505,15 +515,31 @@ struct CSVTableView: NSViewRepresentable {
 
             guard displayOrder.indices.contains(anchorDisplayRow) else { return }
 
+            let rowsBefore = doc.csvRows.count
+            let colsBefore = doc.csvRows.map(\.cells.count).max() ?? 0
+
             var changed = false
             for (rowOffset, pasteRow) in clipGrid.enumerated() {
                 let targetDisplay = anchorDisplayRow + rowOffset
-                guard displayOrder.indices.contains(targetDisplay) else { break }
-                let csvIdx = displayOrder[targetDisplay]
+
+                // Grow the grid to fit the clipboard rather than dropping the
+                // overflow — a 100-row paste into a 10-row file used to lose 90 rows.
+                let csvIdx: Int
+                if displayOrder.indices.contains(targetDisplay) {
+                    csvIdx = displayOrder[targetDisplay]
+                } else {
+                    doc.csvRows.append(CSVRow(cells: []))
+                    csvIdx = doc.csvRows.count - 1
+                    displayOrder.append(csvIdx)
+                }
 
                 for (colOffset, value) in pasteRow.enumerated() {
                     let targetCol = anchorCol + colOffset
-                    guard targetCol < doc.csvRows[csvIdx].cells.count else { continue }
+                    if targetCol >= doc.csvRows[csvIdx].cells.count {
+                        doc.csvRows[csvIdx].cells.append(contentsOf: Array(
+                            repeating: "",
+                            count: targetCol - doc.csvRows[csvIdx].cells.count + 1))
+                    }
                     doc.csvRows[csvIdx].cells[targetCol] = value
                     changed = true
                 }
@@ -522,7 +548,14 @@ struct CSVTableView: NSViewRepresentable {
             guard changed else { return }
             doc.text       = serializeDelimited(doc.csvRows, delimiter: delim)
             doc.isModified = true
-            dt.reloadData()
+
+            // A changed shape needs new NSTableColumns, not just a reload.
+            let colsAfter = doc.csvRows.map(\.cells.count).max() ?? 0
+            if doc.csvRows.count != rowsBefore || colsAfter != colsBefore {
+                rebuildColumns()
+            } else {
+                dt.reloadData()
+            }
         }
 
         /// Parses a TSV/CSV clipboard string into a 2-D grid of strings.

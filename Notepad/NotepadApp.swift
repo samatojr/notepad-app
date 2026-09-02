@@ -12,7 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if extraCount > 0 {
             for i in 0..<extraCount {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + Double(i) * 0.15) {
-                    NotificationCenter.default.post(name: .openSessionTab, object: nil)
+                    // The token lets exactly one window claim this tab — see SessionTabClaims.
+                    NotificationCenter.default.post(name: .openSessionTab, object: nil,
+                                                    userInfo: ["token": UUID()])
                 }
             }
         }
@@ -125,6 +127,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Prompt for every document with unsaved changes. Without this, quitting
+        // silently discarded edits to any file-backed document: sessionState only
+        // caches text for untitled docs, so restore re-read the stale copy on disk.
+        // An untitled, empty document has nothing worth saving — don't nag about it.
+        for doc in DocumentRegistry.shared.allDocuments().filter({
+            $0.isModified && !($0.fileURL == nil && $0.text.isEmpty)
+        }) {
+            let alert = NSAlert.make()
+            alert.messageText = "Save changes to \"\(doc.displayName)\"?"
+            alert.informativeText = "If you don't save, your changes will be lost."
+            alert.addButton(withTitle: "Save")
+            alert.addButton(withTitle: "Don't Save")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: doc.saveDocument()
+            case .alertThirdButtonReturn: return .terminateCancel
+            default: break
+            }
+        }
         AppState.shared.isTerminating = true
         let states = DocumentRegistry.shared.allStates()
         SessionManager.shared.save(states: states)
@@ -147,8 +169,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls {
-            NotificationCenter.default.post(name: .openFile, object: nil, userInfo: ["url": url])
+        // Opening a document should bring the app forward.
+        NSApp.activate()
+        for url in urls { postOpenFile(url, attempt: 0) }
+    }
+
+    /// ContentView only accepts .openFile while it owns the key window, but when the
+    /// app is LAUNCHED by opening a file no window exists yet — the notification was
+    /// posted into the void and the file silently never opened. Wait for a window to
+    /// exist and for session restore to finish claiming its tabs (session tabs also
+    /// consume PendingURLManager), then post. Caps at ~2.5s so the file always opens.
+    private func postOpenFile(_ url: URL, attempt: Int) {
+        let ready = NSApp.keyWindow != nil && !SessionManager.shared.hasPending()
+        guard !ready, attempt < 25 else {
+            // The token lets exactly one window claim this file — see PendingURLManager.
+            NotificationCenter.default.post(name: .openFile, object: nil,
+                                           userInfo: ["url": url, "token": UUID()])
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            self.postOpenFile(url, attempt: attempt + 1)
         }
     }
 }
@@ -165,6 +205,14 @@ struct NotepadApp: App {
     private let updaterController: SPUStandardUpdaterController
 
     init() {
+        // Notepad restores its own windows from SessionManager. AppKit's Resume
+        // feature was *also* reopening the previous run's windows — the lldb
+        // backtrace runs _reopenWindowsAsNecessaryIncludingRestorableState ->
+        // SwiftUI.AppWindowsController.restoreWindow(withIdentifier:state:) — so a
+        // launch reopened last run's window count no matter what the session held,
+        // and a "clean" launch still came up with several blank Untitled windows.
+        // Registering rather than setting keeps this out of the saved preferences.
+        UserDefaults.standard.register(defaults: ["NSQuitAlwaysKeepsWindows": false])
         SessionManager.shared.loadAndEnqueue()
         SessionManager.shared.clearClosedTabs()
         updaterController = SPUStandardUpdaterController(
@@ -285,7 +333,10 @@ struct NotepadCommands: Commands {
             Divider()
             Button("Clear Session") {
                 // Prompt to save each modified document
-                for doc in DocumentRegistry.shared.allDocuments().filter({ $0.isModified }) {
+                // An untitled, empty document has nothing worth saving — don't nag about it.
+        for doc in DocumentRegistry.shared.allDocuments().filter({
+            $0.isModified && !($0.fileURL == nil && $0.text.isEmpty)
+        }) {
                     let alert = NSAlert.make()
                     alert.messageText = "Save changes to \"\(doc.displayName)\"?"
                     alert.informativeText = "Your unsaved changes will be lost if you clear the session."

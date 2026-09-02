@@ -39,7 +39,7 @@ enum Language {
 
 /// One row of a parsed delimited file. UUID identity is intentional:
 /// future cell editing / row insertion tracks by id, not index position.
-struct CSVRow: Identifiable {
+nonisolated struct CSVRow: Identifiable, Sendable {
     let id   = UUID()
     var cells: [String]
 }
@@ -47,11 +47,14 @@ struct CSVRow: Identifiable {
 // MARK: - Delimited File Parsing & Serialization
 
 /// RFC 4180-compliant parser. Strips quotes for display; never touches document.text.
-func parseDelimited(_ text: String, delimiter: Character) -> [CSVRow] {
+/// `nonisolated` so the background parse in parseCSVInBackground is a legal
+/// cross-actor call (the project defaults every declaration to @MainActor).
+nonisolated func parseDelimited(_ text: String, delimiter: Character) -> [CSVRow] {
     var result:   [CSVRow]  = []
     var row:      [String]  = []
     var field     = ""
     var inQuotes  = false
+    var quoted    = false   // this field opened with a quote
     var i         = text.startIndex
 
     while i < text.endIndex {
@@ -67,13 +70,17 @@ func parseDelimited(_ text: String, delimiter: Character) -> [CSVRow] {
                 }
             } else { field.append(c) }
         } else {
-            if      c == "\"" { inQuotes = true }
-            else if c == delimiter { row.append(field); field = "" }
+            // A quote only OPENS a quoted field at the very start of that field.
+            // Anywhere else it is a literal character — an inch mark (5" pipe) or a
+            // stray quote must not swallow the following delimiters and newlines,
+            // which merged rows and silently corrupted the file on the next save.
+            if      c == "\"" && field.isEmpty && !quoted { inQuotes = true; quoted = true }
+            else if c == delimiter { row.append(field); field = ""; quoted = false }
             else if c == "\r\n" || c == "\n" || c == "\r" {
                 // Swift treats \r\n as ONE Character (a single grapheme cluster),
                 // so we must match it explicitly — c == "\r" alone will never fire
                 // for CRLF files, causing the entire file to parse as one row.
-                row.append(field); field = ""
+                row.append(field); field = ""; quoted = false
                 result.append(CSVRow(cells: row)); row = []
             } else { field.append(c) }
         }
@@ -186,7 +193,14 @@ final class SyntaxHighlighter: NSObject, NSTextStorageDelegate {
     /// theme changes so plain text and non-token regions always render correctly
     /// in dark / sepia / light mode rather than falling back to system black.
     var inkColor: NSColor = .labelColor
+    /// The editor's current font. Bold markdown runs are derived from this so they
+    /// track the monospaced face and the zoom level instead of a fixed system font.
+    var baseFont: NSFont = .monospacedSystemFont(ofSize: 13, weight: .regular)
     private var isHighlighting = false
+
+    /// Token highlighting rescans the whole document on every keystroke. Past this
+    /// size that cost dominates typing, so large files render as plain text.
+    private static let maxHighlightLength = 500_000
 
     func textStorage(
         _ textStorage: NSTextStorage,
@@ -214,6 +228,12 @@ final class SyntaxHighlighter: NSObject, NSTextStorageDelegate {
             // programmatic ts.edited(…range: full…) we fire on theme changes,
             // so those paths are still fully colored.
             textStorage.addAttribute(.foregroundColor, value: inkColor, range: editedRange)
+            isHighlighting = false
+            return
+        }
+
+        guard textStorage.length <= Self.maxHighlightLength else {
+            textStorage.addAttribute(.foregroundColor, value: inkColor, range: full)
             isHighlighting = false
             return
         }
@@ -268,11 +288,11 @@ final class SyntaxHighlighter: NSObject, NSTextStorageDelegate {
         ]
         applyPatterns(patterns, to: ts, in: str)
 
-        // Bold
+        // Bold — derived from the editor's own font so it stays monospaced and
+        // follows zoom, instead of snapping to 13pt system.
+        let bold = NSFontManager.shared.convert(baseFont, toHaveTrait: .boldFontMask)
         apply(pattern: #"\*\*[^*]+\*\*|__[^_]+__"#, to: ts, in: str) { range in
-            ts.addAttribute(.font,
-                value: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
-                range: range)
+            ts.addAttribute(.font, value: bold, range: range)
         }
     }
 

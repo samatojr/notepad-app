@@ -70,12 +70,18 @@ final class NotepadDocument {
             fontSize = state.fontSize ?? 13
             if let bm = state.bookmarkData, let url = SessionManager.shared.resolveBookmark(bm) {
                 bookmarkData = bm; fileURL = url
+                let onDisk = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
                 if let saved = state.unsavedText {
-                    text = saved; isModified = true   // cached edits take priority over disk
+                    // Cached edits take priority over disk, but only count as
+                    // "modified" when they actually differ from what's on disk.
+                    text = saved; isModified = saved != onDisk
                 } else {
-                    text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                    text = onDisk
                 }
-            } else if let saved = state.unsavedText {
+            } else if let saved = state.unsavedText, !saved.isEmpty {
+                // An empty untitled tab is not an unsaved document. Restoring it as
+                // "Edited" made the window title lie and the quit prompt nag about
+                // a blank window.
                 text = saved; isModified = true
             }
             restoreCSV(from: state)
@@ -87,12 +93,18 @@ final class NotepadDocument {
             fontSize = state.fontSize ?? 13
             if let bm = state.bookmarkData, let url = SessionManager.shared.resolveBookmark(bm) {
                 bookmarkData = bm; fileURL = url
+                let onDisk = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
                 if let saved = state.unsavedText {
-                    text = saved; isModified = true   // cached edits take priority over disk
+                    // Cached edits take priority over disk, but only count as
+                    // "modified" when they actually differ from what's on disk.
+                    text = saved; isModified = saved != onDisk
                 } else {
-                    text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                    text = onDisk
                 }
-            } else if let saved = state.unsavedText {
+            } else if let saved = state.unsavedText, !saved.isEmpty {
+                // An empty untitled tab is not an unsaved document. Restoring it as
+                // "Edited" made the window title lie and the quit prompt nag about
+                // a blank window.
                 text = saved; isModified = true
             }
             restoreCSV(from: state)
@@ -123,10 +135,13 @@ final class NotepadDocument {
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let rows = parseDelimited(raw, delimiter: delimiter)
+            // Bind self to a let BEFORE the await — referencing the captured weak
+            // var across a suspension point is an error under Swift 6.
+            guard let self else { return }
             await MainActor.run {
-                self?.csvRows        = rows
-                self?.csvIsTableView = showTable
-                self?.csvIsLoading   = false
+                self.csvRows        = rows
+                self.csvIsTableView = showTable
+                self.csvIsLoading   = false
             }
         }
     }
@@ -138,14 +153,21 @@ final class NotepadDocument {
         isModified = false; language = .plain
         isPrettyPrinted = false; originalText = nil
         showFindReplace = false; findHighlightRange = nil
+        findText = ""; replaceText = ""
         csvRows = []; csvDelimiter = nil; csvIsTableView = false
         csvIsLoading = false; csvFindMatchIndex = 0
+        // Table view state is per-document too — leaving it set meant the next CSV
+        // opened in this tab inherited the previous file's sorting and toggles.
+        csvSortKeys = []; csvShowRowNumbers = false; csvShowHeaders = true
     }
 
     func sessionState(index: Int) -> DocumentSessionState {
         DocumentSessionState(
             sessionID: sessionID,
-            unsavedText: (fileURL == nil || (csvDelimiter != nil && isModified)) ? text : nil,
+            // Cache the buffer whenever it differs from disk. Previously only
+            // untitled docs and modified CSVs were cached, so unsaved edits to any
+            // other file-backed document were dropped on restore.
+            unsavedText: (fileURL == nil || isModified) ? text : nil,
             bookmarkData: bookmarkData,
             wordWrap: wordWrap,
             showStatusBar: showStatusBar,
@@ -225,6 +247,10 @@ final class NotepadDocument {
 
     func prettyPrintDocument() {
         if isPrettyPrinted {
+            // Restoring replaces the buffer with the raw file text. Confirm first —
+            // this used to discard unsaved edits AND clear isModified, so the work
+            // was gone with nothing left to warn about at quit time.
+            if isModified, !confirmDiscard() { return }
             // Restore original file text
             let restoreTo = originalText ?? text
             let old = text
@@ -285,7 +311,15 @@ final class NotepadDocument {
 
     func saveAsDocument() {
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.plainText]
+        // Offer the document's own type. Hardcoding .plainText made the panel
+        // rewrite "data.csv" to "data.csv.txt", which also dropped grid view.
+        if let ext = fileURL?.pathExtension, !ext.isEmpty,
+           let type = UTType(filenameExtension: ext) {
+            panel.allowedContentTypes = [type]
+        } else {
+            panel.allowedContentTypes = [.plainText]
+        }
+        panel.allowsOtherFileTypes = true
         panel.nameFieldStringValue = fileURL?.lastPathComponent ?? "Untitled.txt"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         writeFile(to: url)
@@ -360,8 +394,14 @@ final class DocumentRegistry {
     static let shared = DocumentRegistry()
     private init() {}
     private var documents: [ObjectIdentifier: NotepadDocument] = [:]
+    private var nextOrder = 0
 
     func register(_ doc: NotepadDocument) {
+        // Stamp a stable creation order. allStates() used to take its ordering from
+        // Dictionary iteration, which is unspecified and reseeded every process —
+        // so restored tabs came back in a different order on each launch.
+        doc.windowIndex = nextOrder
+        nextOrder += 1
         documents[ObjectIdentifier(doc)] = doc
     }
 
@@ -370,9 +410,10 @@ final class DocumentRegistry {
     }
 
     func allStates() -> [DocumentSessionState] {
-        documents.values.enumerated().map { idx, doc in
-            doc.sessionState(index: idx)
-        }
+        documents.values
+            .sorted { $0.windowIndex < $1.windowIndex }
+            .enumerated()
+            .map { idx, doc in doc.sessionState(index: idx) }
     }
 
     func allDocuments() -> [NotepadDocument] { Array(documents.values) }
@@ -499,8 +540,16 @@ struct ContentView: View {
             guard NSApp.keyWindow == myWindow else { return }
             openNewWindow()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .openSessionTab)) { _ in
-            guard NSApp.keyWindow == myWindow else { return }
+        .onReceive(NotificationCenter.default.publisher(for: .openSessionTab)) { note in
+            // Claimed by token rather than by window identity, for the same reason
+            // .openFile is: at launch NSApp.keyWindow is routinely some window other
+            // than any ContentView's, so the old guard dropped every restored tab and
+            // the session came back one window instead of N.
+            if let token = note.userInfo?["token"] as? UUID {
+                guard SessionTabClaims.shared.claim(token) else { return }
+            } else {
+                guard NSApp.keyWindow == myWindow else { return }
+            }
             openNewTab()
         }
         .onReceive(NotificationCenter.default.publisher(for: .clearSession)) { _ in
@@ -514,9 +563,17 @@ struct ContentView: View {
             AppState.shared.isClearingSession = false
         }
         .onReceive(NotificationCenter.default.publisher(for: .openFile)) { note in
-            // Only handles Finder/double-click opens via application(_:open:)
-            guard NSApp.keyWindow == myWindow,
-                  let url = note.userInfo?["url"] as? URL else { return }
+            // Finder / `open` / double-click opens, via application(_:open:).
+            // Claiming by token rather than by window identity: NSApp.keyWindow
+            // frequently matches none of the ContentViews' own windows (and at
+            // launch there may be no key window at all), which silently dropped
+            // the file and made opening a document from Finder do nothing.
+            guard let url = note.userInfo?["url"] as? URL else { return }
+            if let token = note.userInfo?["token"] as? UUID {
+                guard PendingURLManager.shared.claim(token) else { return }
+            } else {
+                guard NSApp.keyWindow == myWindow else { return }
+            }
             handleFileOpen(url: url)
         }
     }
@@ -636,13 +693,23 @@ private struct WindowAccessor: NSViewRepresentable {
 
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
+        attach(to: view, attempt: 0)
+        return view
+    }
+
+    /// Retries until the view is in a window. A single 0.05s attempt left some
+    /// windows permanently without a reference, which disabled every notification
+    /// guarded on window identity (new tab, new window, clear session) for them.
+    private func attach(to view: NSView, attempt: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            guard let window = view.window else { return }
+            guard let window = view.window else {
+                if attempt < 40 { attach(to: view, attempt: attempt + 1) }
+                return
+            }
             window.tabbingMode = .preferred
             window.tabbingIdentifier = "NotepadMain"
             onWindow(window)
         }
-        return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
@@ -727,14 +794,33 @@ struct StatusBarView: View {
     private var text: String { document.text }
     private var language: Language { document.language }
 
+    /// Every computed property here re-runs on each render — i.e. on every
+    /// keystroke. Past this size the full-document JSON parse is skipped.
+    private static let liveValidationLimit = 1_000_000   // bytes
+
+    // Counted in a single non-allocating pass; components(separatedBy:) built a
+    // throwaway array of every word in the document on each keystroke.
     private var words: Int {
-        text.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.count
+        var count = 0
+        var inWord = false
+        for scalar in text.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                inWord = false
+            } else if !inWord {
+                inWord = true; count += 1
+            }
+        }
+        return count
     }
     private var characters: Int { text.count }
-    private var lines: Int { text.isEmpty ? 1 : text.components(separatedBy: "\n").count }
+    private var lines: Int {
+        text.isEmpty ? 1 : text.unicodeScalars.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+    }
 
     private var jsonStatus: String? {
         guard language == .json, !text.isEmpty else { return nil }
+        // Re-parsing a multi-megabyte document on every keystroke made typing crawl.
+        guard text.utf8.count <= Self.liveValidationLimit else { return nil }
         guard let data = text.data(using: .utf8) else { return "JSON Error: invalid encoding" }
         do {
             _ = try JSONSerialization.jsonObject(with: data)

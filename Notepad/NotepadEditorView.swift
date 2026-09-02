@@ -42,7 +42,12 @@ private final class NotepadTextView: NSTextView {
     /// if so, fires onAutoGrid so the coordinator can switch to table view.
     override func paste(_ sender: Any?) {
         let pb = NSPasteboard.general
-        guard let plain = pb.string(forType: .string) else { return }
+        guard let plain = pb.string(forType: .string) else {
+            // No plain-text flavour (image, file promise, …) — let AppKit handle it
+            // rather than making ⌘V a silent no-op.
+            super.paste(sender)
+            return
+        }
 
         // Only auto-switch when the paste covers the entire document.
         let totalLen = (string as NSString).length
@@ -142,6 +147,7 @@ struct NotepadEditorView: NSViewRepresentable {
         let highlighter = context.coordinator.highlighter
         highlighter.language = document.language
         highlighter.inkColor = AppPreferences.shared.paperTheme.inkColor
+        highlighter.baseFont = .monospacedSystemFont(ofSize: document.fontSize, weight: .regular)
         textView.textStorage?.delegate = highlighter
 
         context.coordinator.isUpdatingFromCode = true
@@ -221,8 +227,18 @@ struct NotepadEditorView: NSViewRepresentable {
                 // ── Font size (zoom) ──────────────────────────────────────────
                 let newFontSize = doc.fontSize
                 if self.lastFontSize != newFontSize {
-                    textView.font = .monospacedSystemFont(ofSize: newFontSize, weight: .regular)
+                    let font = NSFont.monospacedSystemFont(ofSize: newFontSize, weight: .regular)
+                    textView.font = font
+                    self.highlighter.baseFont = font
                     self.lastFontSize = newFontSize
+                    // Setting textView.font rewrites the whole storage, wiping the
+                    // highlighter's bold runs — re-run it so markdown bold survives
+                    // zooming and matches the new size.
+                    if let ts = textView.textStorage, ts.length > 0 {
+                        ts.edited(.editedCharacters,
+                                  range: NSRange(location: 0, length: ts.length),
+                                  changeInLength: 0)
+                    }
                 }
 
                 // ── Word wrap ─────────────────────────────────────────────────
