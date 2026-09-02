@@ -15,9 +15,11 @@ final class CSVEditableField: NSTextField {
 // MARK: - NSTableView subclass for ⌘C copy, ⌘V paste, right-click menu
 
 final class CopyableTableView: NSTableView {
-    var copyHandler:   (() -> Void)?
-    var pasteHandler:  (() -> Void)?
-    var deleteHandler: (() -> Void)?
+    var copyHandler:      (() -> Void)?
+    var pasteHandler:     (() -> Void)?
+    var deleteHandler:    (() -> Void)?
+    var insertHandler:    (() -> Void)?
+    var duplicateHandler: (() -> Void)?
 
     /// Tracks the last data column index the user clicked — used as the paste anchor column.
     private(set) var lastClickedDataColumn: Int = 0
@@ -72,10 +74,22 @@ final class CopyableTableView: NSTableView {
             menu.addItem(pasteItem)
         }
 
-        // Delete rows — only when rows are selected
+        // Row operations — insert always, the rest only with a selection
+        if menu.items.count > 0 { menu.addItem(.separator()) }
+        let insert = NSMenuItem(title: "Insert Row", action: #selector(insertRow(_:)),
+                                keyEquivalent: "")
+        insert.target = self
+        menu.addItem(insert)
+
         if !selectedRowIndexes.isEmpty {
-            if menu.items.count > 0 { menu.addItem(.separator()) }
             let count = selectedRowIndexes.count
+            let dupLabel = count == 1 ? "Duplicate Row" : "Duplicate \(count) Rows"
+            let dup = NSMenuItem(title: dupLabel, action: #selector(duplicateRows(_:)),
+                                 keyEquivalent: "")
+            dup.target = self
+            menu.addItem(dup)
+
+            menu.addItem(.separator())
             let label = count == 1 ? "Delete Row" : "Delete \(count) Rows"
             let del   = NSMenuItem(title: label, action: #selector(deleteRows(_:)),
                                    keyEquivalent: "")
@@ -86,7 +100,9 @@ final class CopyableTableView: NSTableView {
         return menu.items.isEmpty ? nil : menu
     }
 
-    @objc private func deleteRows(_ sender: Any?) { deleteHandler?() }
+    @objc private func deleteRows(_ sender: Any?)    { deleteHandler?() }
+    @objc private func insertRow(_ sender: Any?)     { insertHandler?() }
+    @objc private func duplicateRows(_ sender: Any?) { duplicateHandler?() }
 }
 
 // MARK: - Find match coordinate
@@ -117,6 +133,8 @@ struct CSVTableView: NSViewRepresentable {
         dataTable.copyHandler   = { [weak coord] in coord?.copySelectedRows() }
         dataTable.pasteHandler  = { [weak coord] in coord?.pasteFromClipboard() }
         dataTable.deleteHandler = { [weak coord] in coord?.deleteSelectedRows() }
+        dataTable.insertHandler = { [weak coord] in coord?.insertRowBelowSelection() }
+        dataTable.duplicateHandler = { [weak coord] in coord?.duplicateSelectedRows() }
 
         let scrollView = NSScrollView()
         scrollView.documentView          = dataTable
@@ -148,6 +166,10 @@ struct CSVTableView: NSViewRepresentable {
         // Display order: indices into doc.csvRows for each table row
         private var displayOrder: [Int] = []
 
+        /// Alignment per data column, inferred from the sampled values in
+        /// rebuildColumns. Numbers right, short codes centered, text left.
+        private var columnAlignments: [ColumnAlignment] = []
+
         // Find state
         private var findMatches:       [CSVMatch] = []
         private var currentMatchIndex: Int        = -1
@@ -159,10 +181,35 @@ struct CSVTableView: NSViewRepresentable {
         private var lastShowRowNumbers: Bool = false
         private var lastShowHeaders:    Bool = true
         private var lastSortKeys:       [CSVSortKey] = []
+        private var lastStructureVersion: Int = 0
+        private var lastFontSize:         CGFloat?
+        private var lastGridRequestID:    Int?
 
         // Local key monitor for ⌘V — bypasses AppKit's menu key-equivalent
         // interception so paste reaches us before the Edit menu consumes it.
         private var keyMonitor: Any?
+
+        // MARK: Fonts
+        //
+        // The grid is monospaced for the same reason the editor is: in a column of
+        // numbers the digits have to line up, and a proportional font makes "1.00"
+        // and "88.75" different widths. It also means the column-width maths can
+        // measure one character instead of guessing an average.
+
+        private var gridFont: NSFont {
+            .monospacedSystemFont(ofSize: document?.fontSize ?? 13, weight: .regular)
+        }
+
+        /// Exact advance of one character — correct by definition for a monospaced
+        /// font, where the old `chars * 8.0` guess was only ever close.
+        private var charWidth: CGFloat {
+            ("0" as NSString).size(withAttributes: [.font: gridFont]).width
+        }
+
+        private var rowHeight: CGFloat {
+            let font = gridFont
+            return ceil(font.ascender - font.descender + font.leading) + 6
+        }
 
         // MARK: Helpers
 
@@ -234,13 +281,15 @@ struct CSVTableView: NSViewRepresentable {
             let dataCount   = max(0, doc.csvRows.count - offset)
 
             // ── Optional row-number column ───────────────────────────────────
+            let cellWidth = charWidth
+
             if doc.csvShowRowNumbers {
                 let digits = dataCount > 0 ? Int(log10(Double(dataCount))) + 1 : 1
                 let numCol = NSTableColumn(identifier: .init("col_rownum"))
                 numCol.title                  = "#"
                 numCol.isEditable             = false
                 numCol.minWidth               = 30
-                numCol.width                  = max(30, CGFloat(digits) * 7.0 + 16)
+                numCol.width                  = max(30, CGFloat(digits) * cellWidth + 16)
                 numCol.headerCell.alignment   = .center
                 dt.addTableColumn(numCol)
             }
@@ -255,6 +304,8 @@ struct CSVTableView: NSViewRepresentable {
             let sample        = Array(allData.prefix(200))
             let firstRowCells = doc.csvRows.first?.cells ?? []
 
+            columnAlignments = Array(repeating: .leading, count: colCount)
+
             for i in 0..<colCount {
                 let title: String = showHeaders
                     ? { let t = titleRow[i]; return t.isEmpty ? "Column \(i+1)" : t }()
@@ -263,16 +314,38 @@ struct CSVTableView: NSViewRepresentable {
                 let col = NSTableColumn(identifier: .init("col_\(i)"))
                 col.title      = title
                 col.isEditable = true
-                if !showHeaders { col.headerCell.alignment = .center }
+                // The header row deliberately keeps the system font: NSTableHeaderCell
+                // ignores a font override under the .inset table style anyway, and the
+                // native small header reads as chrome, which separates it from the
+                // monospaced data below.
 
-                let avgChars: CGFloat = sample.isEmpty ? 0 : {
-                    let total = sample.reduce(0) { $0 + (i < $1.cells.count ? $1.cells[i].count : 0) }
-                    return CGFloat(total) / CGFloat(sample.count)
-                }()
+                // Width from the LONGEST value in the sample, not the average. With a
+                // proportional font the average was a reasonable hedge; with a
+                // monospaced one the exact width is knowable, and averaging meant any
+                // cell longer than typical (a four-digit quantity in a column of
+                // single digits) truncated for no reason. Capped at 40 characters so
+                // one long note column can't push everything else off screen.
+                // One pass over the sample serves both jobs: the widest value sets
+                // the column width, and the values together decide its alignment.
+                var columnValues: [String] = []
+                columnValues.reserveCapacity(sample.count)
+                var widest: CGFloat = 0
+                for row in sample where i < row.cells.count {
+                    let value = row.cells[i]
+                    widest = max(widest, CGFloat(value.count))
+                    columnValues.append(value)
+                }
+
+                columnAlignments[i] = inferColumnAlignment(columnValues)
+                // Headers stay centered whatever the column holds. A spreadsheet
+                // aligns the header to its data; here the data is monospaced and the
+                // header is not, so centering keeps the header reading as chrome
+                // rather than as a misaligned first row.
+                col.headerCell.alignment = .center
                 let firstRowChars = i < firstRowCells.count ? CGFloat(firstRowCells[i].count) : 0
-                let chars = max(CGFloat(title.count), avgChars, firstRowChars)
+                let chars = min(40, max(CGFloat(title.count), widest, firstRowChars))
                 col.minWidth = 30
-                col.width    = min(300, max(30, chars * 8.0 + 8))
+                col.width    = min(360, max(30, chars * cellWidth + 12))
                 dt.addTableColumn(col)
             }
 
@@ -284,43 +357,81 @@ struct CSVTableView: NSViewRepresentable {
         // MARK: Commit cell edit
 
         func commitEdit(tableRow: Int, colIdx: Int, value: String) {
-            guard let doc   = document,
-                  let delim = doc.csvDelimiter,
+            guard let doc = document,
                   displayOrder.indices.contains(tableRow) else { return }
 
             let csvIdx = displayOrder[tableRow]
             guard csvIdx < doc.csvRows.count else { return }
 
-            // Ragged rows are legal CSV. Pad short rows so their trailing cells stay
-            // editable instead of silently swallowing the edit.
-            if colIdx >= doc.csvRows[csvIdx].cells.count {
-                doc.csvRows[csvIdx].cells.append(contentsOf: Array(
-                    repeating: "", count: colIdx - doc.csvRows[csvIdx].cells.count + 1))
+            doc.mutateCSV(actionName: "Edit Cell") { rows in
+                // Ragged rows are legal CSV. Pad short rows so their trailing cells
+                // stay editable instead of silently swallowing the edit.
+                if colIdx >= rows[csvIdx].cells.count {
+                    rows[csvIdx].cells.append(contentsOf: Array(
+                        repeating: "", count: colIdx - rows[csvIdx].cells.count + 1))
+                }
+                rows[csvIdx].cells[colIdx] = value
             }
-            guard doc.csvRows[csvIdx].cells[colIdx] != value else { return }
-
-            doc.csvRows[csvIdx].cells[colIdx] = value
-            doc.text       = serializeDelimited(doc.csvRows, delimiter: delim)
-            doc.isModified = true
         }
 
         // MARK: Delete selected rows
 
         func deleteSelectedRows() {
-            guard let dt    = tableView,
-                  let doc   = document,
-                  let delim = doc.csvDelimiter else { return }
+            guard let dt  = tableView,
+                  let doc = document else { return }
 
             let selected = dt.selectedRowIndexes
             guard !selected.isEmpty else { return }
 
-            let csvIndices = selected.compactMap {
+            let csvIndices = IndexSet(selected.compactMap {
                 displayOrder.indices.contains($0) ? displayOrder[$0] : nil
+            })
+            let label = csvIndices.count == 1 ? "Delete Row" : "Delete Rows"
+            doc.mutateCSV(actionName: label) { rows in
+                rows.remove(atOffsets: csvIndices)
             }
-            doc.csvRows.remove(atOffsets: IndexSet(csvIndices))
-            doc.text       = serializeDelimited(doc.csvRows, delimiter: delim)
-            doc.isModified = true
 
+            rebuildDisplayOrder(in: doc)
+            dt.reloadData()
+        }
+
+        // MARK: Insert / duplicate rows
+
+        /// Inserts a blank row below the selection (or at the end when nothing is
+        /// selected), matching the current column count.
+        func insertRowBelowSelection() {
+            guard let dt = tableView, let doc = document else { return }
+            let columnCount = doc.csvRows.map(\.cells.count).max() ?? 1
+            let anchor = dt.selectedRowIndexes.max()
+            let insertAt: Int = {
+                guard let anchor, displayOrder.indices.contains(anchor) else {
+                    return doc.csvRows.count
+                }
+                return displayOrder[anchor] + 1
+            }()
+            doc.mutateCSV(actionName: "Insert Row") { rows in
+                rows.insert(CSVRow(cells: Array(repeating: "", count: max(1, columnCount))),
+                            at: min(insertAt, rows.count))
+            }
+            rebuildDisplayOrder(in: doc)
+            dt.reloadData()
+        }
+
+        /// Copies each selected row directly beneath itself.
+        func duplicateSelectedRows() {
+            guard let dt = tableView, let doc = document else { return }
+            let csvIndices = dt.selectedRowIndexes.compactMap {
+                displayOrder.indices.contains($0) ? displayOrder[$0] : nil
+            }.sorted()
+            guard !csvIndices.isEmpty else { return }
+
+            let label = csvIndices.count == 1 ? "Duplicate Row" : "Duplicate Rows"
+            doc.mutateCSV(actionName: label) { rows in
+                // Walk backwards so the earlier insertion points stay valid.
+                for index in csvIndices.reversed() where rows.indices.contains(index) {
+                    rows.insert(CSVRow(cells: rows[index].cells), at: index + 1)
+                }
+            }
             rebuildDisplayOrder(in: doc)
             dt.reloadData()
         }
@@ -384,6 +495,37 @@ struct CSVTableView: NSViewRepresentable {
                     if let colIdx = dt.tableColumns.firstIndex(where: {
                         $0.identifier.rawValue == "col_\(m.col)"
                     }) { dt.scrollColumnToVisible(colIdx) }
+                }
+
+                // ── Zoom ──────────────────────────────────────────────────────
+                // ⌘+ / ⌘− and the status-bar zoom control have always changed
+                // doc.fontSize; in grid mode nothing was listening, so they did
+                // nothing at all. Column widths and row height both derive from the
+                // font, so a size change means a full rebuild.
+                let fontSize = doc.fontSize
+                if fontSize != lastFontSize {
+                    lastFontSize = fontSize
+                    rebuildColumns()
+                    dt.noteHeightOfRows(withIndexesChanged: IndexSet(0..<dt.numberOfRows))
+                    return
+                }
+
+                // ── Grid mutation changed the table's shape → rebuild columns ──
+                let structureVersion = doc.csvStructureVersion
+                if structureVersion != lastStructureVersion {
+                    lastStructureVersion = structureVersion
+                    rebuildColumns()
+                    return
+                }
+
+                // ── Go to Row ─────────────────────────────────────────────────
+                if let request = doc.gridRowRequest, request.id != lastGridRequestID {
+                    lastGridRequestID = request.id
+                    let row = request.range.location
+                    if row < displayOrder.count {
+                        dt.scrollRowToVisible(row)
+                        dt.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                    }
                 }
 
                 // ── Row numbers or Headers toggled → rebuild columns ───────────
@@ -498,10 +640,10 @@ struct CSVTableView: NSViewRepresentable {
         // MARK: Paste (Google Sheets / TSV grid detection)
 
         func pasteFromClipboard() {
-            guard let dt    = tableView,
-                  let doc   = document,
-                  let delim = doc.csvDelimiter else { return }
-            guard let clip  = NSPasteboard.general.string(forType: .string),
+            guard let dt  = tableView,
+                  let doc = document,
+                  doc.csvDelimiter != nil else { return }
+            guard let clip = NSPasteboard.general.string(forType: .string),
                   !clip.isEmpty else { return }
 
             // Parse clipboard as a TSV grid (Google Sheets copies tab-separated rows).
@@ -512,50 +654,39 @@ struct CSVTableView: NSViewRepresentable {
             // Anchor: top-left of the current row selection + last clicked column.
             let anchorDisplayRow = dt.selectedRowIndexes.min() ?? 0
             let anchorCol        = dt.lastClickedDataColumn
-
             guard displayOrder.indices.contains(anchorDisplayRow) else { return }
+            let order = displayOrder
 
-            let rowsBefore = doc.csvRows.count
-            let colsBefore = doc.csvRows.map(\.cells.count).max() ?? 0
+            doc.mutateCSV(actionName: "Paste") { rows in
+                for (rowOffset, pasteRow) in clipGrid.enumerated() {
+                    let targetDisplay = anchorDisplayRow + rowOffset
 
-            var changed = false
-            for (rowOffset, pasteRow) in clipGrid.enumerated() {
-                let targetDisplay = anchorDisplayRow + rowOffset
-
-                // Grow the grid to fit the clipboard rather than dropping the
-                // overflow — a 100-row paste into a 10-row file used to lose 90 rows.
-                let csvIdx: Int
-                if displayOrder.indices.contains(targetDisplay) {
-                    csvIdx = displayOrder[targetDisplay]
-                } else {
-                    doc.csvRows.append(CSVRow(cells: []))
-                    csvIdx = doc.csvRows.count - 1
-                    displayOrder.append(csvIdx)
-                }
-
-                for (colOffset, value) in pasteRow.enumerated() {
-                    let targetCol = anchorCol + colOffset
-                    if targetCol >= doc.csvRows[csvIdx].cells.count {
-                        doc.csvRows[csvIdx].cells.append(contentsOf: Array(
-                            repeating: "",
-                            count: targetCol - doc.csvRows[csvIdx].cells.count + 1))
+                    // Grow the grid to fit the clipboard rather than dropping the
+                    // overflow — a 100-row paste into a 10-row file used to lose 90 rows.
+                    let csvIdx: Int
+                    if order.indices.contains(targetDisplay) {
+                        csvIdx = order[targetDisplay]
+                    } else {
+                        rows.append(CSVRow(cells: []))
+                        csvIdx = rows.count - 1
                     }
-                    doc.csvRows[csvIdx].cells[targetCol] = value
-                    changed = true
+                    guard rows.indices.contains(csvIdx) else { continue }
+
+                    for (colOffset, value) in pasteRow.enumerated() {
+                        let targetCol = anchorCol + colOffset
+                        if targetCol >= rows[csvIdx].cells.count {
+                            rows[csvIdx].cells.append(contentsOf: Array(
+                                repeating: "",
+                                count: targetCol - rows[csvIdx].cells.count + 1))
+                        }
+                        rows[csvIdx].cells[targetCol] = value
+                    }
                 }
             }
-
-            guard changed else { return }
-            doc.text       = serializeDelimited(doc.csvRows, delimiter: delim)
-            doc.isModified = true
 
             // A changed shape needs new NSTableColumns, not just a reload.
-            let colsAfter = doc.csvRows.map(\.cells.count).max() ?? 0
-            if doc.csvRows.count != rowsBefore || colsAfter != colsBefore {
-                rebuildColumns()
-            } else {
-                dt.reloadData()
-            }
+            rebuildDisplayOrder(in: doc)
+            rebuildColumns()
         }
 
         /// Parses a TSV/CSV clipboard string into a 2-D grid of strings.
@@ -600,6 +731,9 @@ struct CSVTableView: NSViewRepresentable {
                 }
                 lbl?.stringValue = "\(row + 1)"
                 lbl?.textColor   = .tertiaryLabelColor
+                // Set on every pass, not just on creation: these views are reused,
+                // and the font changes when the user zooms.
+                lbl?.font        = gridFont
                 return lbl
             }
 
@@ -630,7 +764,10 @@ struct CSVTableView: NSViewRepresentable {
             let cells  = csvIdx >= 0 && csvIdx < doc.csvRows.count ? doc.csvRows[csvIdx].cells : []
             f.stringValue = colIdx < cells.count ? cells[colIdx] : ""
             f.textColor   = .labelColor
-            f.alignment   = .left
+            f.font        = gridFont
+            f.alignment   = columnAlignments.indices.contains(colIdx)
+                ? columnAlignments[colIdx].textAlignment
+                : .left
 
             // Find highlighting
             let match     = CSVMatch(row: row, col: colIdx)
@@ -653,7 +790,16 @@ struct CSVTableView: NSViewRepresentable {
             return f
         }
 
-        func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 22 }
+        /// Publishes the selection to the document. The status bar reads it today;
+        /// per-column stats (sum / average of the selected rows) will read the same
+        /// values.
+        func tableViewSelectionDidChange(_ notification: Notification) {
+            guard let dt = tableView, let doc = document else { return }
+            let count = dt.selectedRowIndexes.count
+            if doc.csvSelectedRowCount != count { doc.csvSelectedRowCount = count }
+        }
+
+        func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { rowHeight }
         func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool { true }
 
         // MARK: Double-click column divider → auto-size
@@ -667,14 +813,15 @@ struct CSVTableView: NSViewRepresentable {
             guard let colIdxStr = col.identifier.rawValue.split(separator: "_").last,
                   let colIdx    = Int(colIdxStr) else { return 80 }
 
-            let headerWidth = CGFloat(col.title.count) * 7.0 + 8
+            let cellWidth   = charWidth
+            let headerWidth = CGFloat(col.title.count) * cellWidth + 12
             var maxChars: CGFloat = 0
             for csvIdx in displayOrder {
                 if colIdx < doc.csvRows[csvIdx].cells.count {
                     maxChars = max(maxChars, CGFloat(doc.csvRows[csvIdx].cells[colIdx].count))
                 }
             }
-            return min(600, max(30, max(headerWidth, maxChars * 8.0 + 8)))
+            return min(600, max(30, max(headerWidth, maxChars * cellWidth + 12)))
         }
     }
 }

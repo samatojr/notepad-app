@@ -331,6 +331,31 @@ struct NotepadCommands: Commands {
             Divider()
             recentFilesMenu
             Divider()
+            Menu("Reopen with Encoding") {
+                ForEach(FileEncoding.menuCases, id: \.self) { encoding in
+                    Button(encoding.displayName) { document?.reopen(with: encoding) }
+                }
+            }
+            .disabled(document?.fileURL == nil)
+            Menu("Save with Encoding") {
+                ForEach(FileEncoding.menuCases, id: \.self) { encoding in
+                    Toggle(isOn: Binding(
+                        get: { document?.fileEncoding == encoding },
+                        set: { if $0 { document?.setEncoding(encoding) } }
+                    )) { Text(encoding.displayName) }
+                }
+            }
+            .disabled(document == nil)
+            Menu("Line Endings") {
+                ForEach(LineEnding.allCases, id: \.self) { ending in
+                    Toggle(isOn: Binding(
+                        get: { document?.lineEnding == ending },
+                        set: { if $0 { document?.setLineEnding(ending) } }
+                    )) { Text(ending.displayName) }
+                }
+            }
+            .disabled(document == nil)
+            Divider()
             Button("Clear Session") {
                 // Prompt to save each modified document
                 // An untitled, empty document has nothing worth saving — don't nag about it.
@@ -361,6 +386,15 @@ struct NotepadCommands: Commands {
                 .keyboardShortcut("S")
         }
 
+        // ── Printing ─────────────────────────────────────────────────────────
+        CommandGroup(replacing: .printItem) {
+            Button("Page Setup…") { DocumentPrinter.pageSetup(window: NSApp.keyWindow) }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+            Button("Print…") { document?.printDocument(window: NSApp.keyWindow) }
+                .keyboardShortcut("p")
+                .disabled(document == nil)
+        }
+
         CommandGroup(replacing: .appInfo) {
             Button("About Notepad") { showAbout() }
             Divider()
@@ -377,6 +411,10 @@ struct NotepadCommands: Commands {
                 .keyboardShortcut("g")
             Button("Find Previous") { document?.findPrevious() }
                 .keyboardShortcut("G")
+            Divider()
+            Button("Go to Line…") { document?.promptGoToLine() }
+                .keyboardShortcut("l")
+                .disabled(document == nil)
             Divider()
             Button("Word Count…") { document?.showWordCount = true }
                 .keyboardShortcut("i", modifiers: [.command, .shift])

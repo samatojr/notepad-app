@@ -17,3 +17,4 @@ build/
 .DS_Store
 *.swp
 sparkle_private_key*.txt
+appcast.xml.bak

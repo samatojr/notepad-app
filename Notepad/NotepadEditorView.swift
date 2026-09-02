@@ -196,6 +196,7 @@ struct NotepadEditorView: NSViewRepresentable {
         private var lastHighlightRange: NSRange?
         private var lastFontSize:       CGFloat?
         private var lastPaperTheme:     PaperTheme?
+        private var lastSelectionRequestID: Int?
 
         /// Self-renewing observation chain: re-subscribes after every change so
         /// any model mutation (text, wordWrap, language, findHighlightRange)
@@ -275,6 +276,20 @@ struct NotepadEditorView: NSViewRepresentable {
                 if self.lastPaperTheme != theme {
                     applyPaperTheme(theme, scrollView: scrollView, textView: textView)
                     self.lastPaperTheme = theme
+                }
+
+                // ── Go to Line / explicit selection request ───────────────────
+                // Carries its own id so asking for the same line twice scrolls
+                // twice; comparing ranges alone would swallow the second ask.
+                if let request = doc.selectionRequest,
+                   request.id != self.lastSelectionRequestID {
+                    self.lastSelectionRequestID = request.id
+                    let len = (doc.text as NSString).length
+                    if request.range.upperBound <= len {
+                        textView.setSelectedRange(request.range)
+                        textView.scrollRangeToVisible(request.range)
+                        textView.window?.makeFirstResponder(textView)
+                    }
                 }
 
                 // ── Find highlight ────────────────────────────────────────────

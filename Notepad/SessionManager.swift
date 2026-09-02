@@ -23,6 +23,11 @@ struct DocumentSessionState: Codable {
     var csvDelimiter: String?         // "," or "\t"; nil = not a tabular file
     var csvIsTableView: Bool?         // nil = not applicable
     var csvSortKeys: [CSVSortKey]?    // nil / empty = unsorted
+    // Text encoding and line ending, as FileEncoding/LineEnding raw values.
+    // Optional so sessions written before 3.4 still decode; a nil means
+    // "assume UTF-8 / LF", which is what those builds always did.
+    var fileEncoding: String?
+    var lineEnding: String?
 
     /// An untitled document with no text has nothing to restore — it comes back as a
     /// blank "Untitled" window. Recording those means a quit persists whatever blank

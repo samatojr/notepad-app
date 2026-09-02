@@ -21,6 +21,13 @@ final class NotepadDocument {
     var originalText: String? = nil   // raw file text saved when auto-formatting on open
     var fontSize: CGFloat = 13        // editor display size (view-only, never affects file)
 
+    // How this document came off disk and how it goes back. `text` is always
+    // LF-normalized in memory; the original line ending is restored on write.
+    // See FileIO.swift — guessing UTF-8 and swallowing the failure used to open
+    // non-UTF-8 files as blank and then save that blankness over them.
+    var fileEncoding: FileEncoding = .utf8
+    var lineEnding:   LineEnding   = .lf
+
     // CSV/TSV — purely view state; document.text is always the source of truth
     var csvRows:           [CSVRow]   = []    // parsed table; row 0 = header
     var csvDelimiter:      Character? = nil   // nil = not in tabular mode
@@ -30,8 +37,24 @@ final class NotepadDocument {
     var csvShowRowNumbers: Bool       = false // show # column in table view (off by default)
     var csvShowHeaders:   Bool       = true  // show column header row in table view (on by default)
     var csvSortKeys: [CSVSortKey] = []   // ordered: first = primary sort
+    var csvSelectedRowCount: Int = 0     // published by the grid for the status bar
+    /// Bumped whenever a grid mutation changes the table's shape (row count,
+    /// column count, header text) so the table rebuilds its columns instead of
+    /// merely reloading — a plain reload would keep stale titles and widths.
+    var csvStructureVersion: Int = 0
 
     var isBeingExplicitlyClosed: Bool = false  // set true when user deliberately closes; skips session restore
+
+    /// One-shot request for the view to select and scroll to a range. The id
+    /// makes a repeat of the same range fire again — asking to go to line 40
+    /// twice must scroll twice, and comparing ranges alone would swallow it.
+    struct SelectionRequest: Equatable {
+        let range: NSRange
+        let id: Int
+    }
+    var selectionRequest: SelectionRequest? = nil   // text mode: character range
+    var gridRowRequest:   SelectionRequest? = nil   // grid mode: .location = display row
+    private var requestCounter = 0
 
     var showFindReplace: Bool = false
     var findText: String = ""
@@ -46,72 +69,95 @@ final class NotepadDocument {
     var displayName: String { fileURL?.lastPathComponent ?? "Untitled" }
 
     init() {
-        if let url = PendingURLManager.shared.pendingURL {
+        // Resolve everything the initializer needs BEFORE touching self, so the
+        // shared load/restore helpers below can be plain methods rather than
+        // three near-identical copies of the same twenty lines.
+        let pendingURL = PendingURLManager.shared.pendingURL
+        let restoreState: DocumentSessionState? = pendingURL == nil
+            ? (SessionManager.shared.popClosed() ?? SessionManager.shared.popPending())
+            : nil
+        sessionID = restoreState?.sessionID ?? UUID()
+
+        if let url = pendingURL {
             PendingURLManager.shared.pendingURL = nil
-            sessionID = UUID()
-            fileURL = url
-            bookmarkData = SessionManager.shared.makeBookmark(for: url)
-            let raw  = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-            let lang = Language.detect(from: url)
-            if lang.canPrettyPrint, let formatted = prettyPrint(text: raw, language: lang) {
-                originalText = raw; text = formatted; isPrettyPrinted = true
-            } else {
-                originalText = nil; text = raw
-            }
-            if lang.isTabular, let delim = lang.tabularDelimiter {
-                parseCSVInBackground(raw, delimiter: delim, showTable: true)
-            }
-            RecentFilesManager.shared.add(url)
-        } else if let state = SessionManager.shared.popClosed() {
-            sessionID = state.sessionID
-            wordWrap = state.wordWrap
-            showStatusBar = state.showStatusBar
-            windowIndex = state.windowIndex
-            fontSize = state.fontSize ?? 13
-            if let bm = state.bookmarkData, let url = SessionManager.shared.resolveBookmark(bm) {
-                bookmarkData = bm; fileURL = url
-                let onDisk = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-                if let saved = state.unsavedText {
-                    // Cached edits take priority over disk, but only count as
-                    // "modified" when they actually differ from what's on disk.
-                    text = saved; isModified = saved != onDisk
-                } else {
-                    text = onDisk
-                }
-            } else if let saved = state.unsavedText, !saved.isEmpty {
-                // An empty untitled tab is not an unsaved document. Restoring it as
-                // "Edited" made the window title lie and the quit prompt nag about
-                // a blank window.
-                text = saved; isModified = true
-            }
-            restoreCSV(from: state)
-        } else if let state = SessionManager.shared.popPending() {
-            sessionID = state.sessionID
-            wordWrap = state.wordWrap
-            showStatusBar = state.showStatusBar
-            windowIndex = state.windowIndex
-            fontSize = state.fontSize ?? 13
-            if let bm = state.bookmarkData, let url = SessionManager.shared.resolveBookmark(bm) {
-                bookmarkData = bm; fileURL = url
-                let onDisk = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-                if let saved = state.unsavedText {
-                    // Cached edits take priority over disk, but only count as
-                    // "modified" when they actually differ from what's on disk.
-                    text = saved; isModified = saved != onDisk
-                } else {
-                    text = onDisk
-                }
-            } else if let saved = state.unsavedText, !saved.isEmpty {
-                // An empty untitled tab is not an unsaved document. Restoring it as
-                // "Edited" made the window title lie and the quit prompt nag about
-                // a blank window.
-                text = saved; isModified = true
-            }
-            restoreCSV(from: state)
-        } else {
-            sessionID = UUID()
+            adoptFile(at: url)
+        } else if let state = restoreState {
+            restore(from: state)
         }
         language = Language.detect(from: fileURL)
+    }
+
+    /// Reads `url` and takes it on as this document's file. On failure the URL is
+    /// deliberately NOT retained: a document pointing at a file we could not read
+    /// is one ⌘S away from destroying it.
+    private func adoptFile(at url: URL) {
+        do {
+            let loaded = try TextFileIO.read(url)
+            fileURL      = url
+            bookmarkData = SessionManager.shared.makeBookmark(for: url)
+            apply(loaded, url: url)
+            RecentFilesManager.shared.add(url)
+        } catch {
+            fileURL = nil
+            bookmarkData = nil
+            presentError("Could not open \"\(url.lastPathComponent)\".\n\(error.localizedDescription)")
+        }
+    }
+
+    /// Installs a freshly-read file into the document: encoding, line ending,
+    /// grid parse and pretty-print all follow from it.
+    private func apply(_ loaded: LoadedTextFile, url: URL) {
+        fileEncoding = loaded.encoding
+        lineEnding   = loaded.lineEnding
+
+        let lang = Language.detect(from: url)
+        if lang.isTabular, let delim = lang.tabularDelimiter {
+            parseCSVInBackground(loaded.text, delimiter: delim, showTable: true)
+        } else {
+            csvDelimiter = nil; csvRows = []
+            csvIsTableView = false; csvIsLoading = false
+        }
+
+        if lang.canPrettyPrint, let formatted = prettyPrint(text: loaded.text, language: lang) {
+            originalText = loaded.text; text = formatted; isPrettyPrinted = true
+        } else {
+            originalText = nil; text = loaded.text; isPrettyPrinted = false
+        }
+        csvFindMatchIndex = 0
+    }
+
+    private func restore(from state: DocumentSessionState) {
+        wordWrap      = state.wordWrap
+        showStatusBar = state.showStatusBar
+        windowIndex   = state.windowIndex
+        fontSize      = state.fontSize ?? 13
+        fileEncoding  = state.fileEncoding.flatMap(FileEncoding.init(rawValue:)) ?? .utf8
+        lineEnding    = state.lineEnding.flatMap(LineEnding.init(rawValue:))     ?? .lf
+
+        if let bm = state.bookmarkData, let url = SessionManager.shared.resolveBookmark(bm) {
+            bookmarkData = bm
+            fileURL      = url
+            let onDisk = try? TextFileIO.read(url)
+            if let onDisk {
+                // Trust the file over the saved session: someone may have
+                // re-encoded it between runs.
+                fileEncoding = onDisk.encoding
+                lineEnding   = onDisk.lineEnding
+            }
+            if let saved = state.unsavedText {
+                // Cached edits take priority over disk, but only count as
+                // "modified" when they actually differ from what's on disk.
+                text = saved; isModified = saved != (onDisk?.text ?? "")
+            } else {
+                text = onDisk?.text ?? ""
+            }
+        } else if let saved = state.unsavedText, !saved.isEmpty {
+            // An empty untitled tab is not an unsaved document. Restoring it as
+            // "Edited" made the window title lie and the quit prompt nag about
+            // a blank window.
+            text = saved; isModified = true
+        }
+        restoreCSV(from: state)
     }
 
     private func restoreCSV(from state: DocumentSessionState) {
@@ -159,6 +205,8 @@ final class NotepadDocument {
         // Table view state is per-document too — leaving it set meant the next CSV
         // opened in this tab inherited the previous file's sorting and toggles.
         csvSortKeys = []; csvShowRowNumbers = false; csvShowHeaders = true
+        csvSelectedRowCount = 0
+        fileEncoding = .utf8; lineEnding = .lf
     }
 
     func sessionState(index: Int) -> DocumentSessionState {
@@ -175,8 +223,135 @@ final class NotepadDocument {
             fontSize: fontSize,
             csvDelimiter: csvDelimiter.map { String($0) },
             csvIsTableView: csvDelimiter != nil ? csvIsTableView : nil,
-            csvSortKeys: csvSortKeys.isEmpty ? nil : csvSortKeys
+            csvSortKeys: csvSortKeys.isEmpty ? nil : csvSortKeys,
+            fileEncoding: fileEncoding.rawValue,
+            lineEnding: lineEnding.rawValue
         )
+    }
+
+    // MARK: Go to Line
+
+    var lineCount: Int { Notepad.lineCount(in: text) }
+
+    private func nextRequestID() -> Int {
+        requestCounter += 1
+        return requestCounter
+    }
+
+    /// Selects line `line` (1-based) and scrolls it into view. In grid mode the
+    /// same command jumps to the matching data row instead.
+    func goToLine(_ line: Int) {
+        guard line >= 1 else { return }
+
+        if csvIsTableView && !csvRows.isEmpty {
+            let dataRows = max(0, csvRows.count - (csvShowHeaders ? 1 : 0))
+            guard dataRows > 0 else { return }
+            let row = min(line, dataRows) - 1
+            gridRowRequest = SelectionRequest(range: NSRange(location: row, length: 0),
+                                              id: nextRequestID())
+            return
+        }
+
+        selectionRequest = SelectionRequest(range: lineRange(for: line, in: text),
+                                            id: nextRequestID())
+    }
+
+    /// Asks for a line number and jumps to it.
+    func promptGoToLine() {
+        let limit = csvIsTableView && !csvRows.isEmpty
+            ? max(0, csvRows.count - (csvShowHeaders ? 1 : 0))
+            : lineCount
+        let unit = csvIsTableView && !csvRows.isEmpty ? "Row" : "Line"
+
+        let alert = NSAlert.make()
+        alert.messageText = "Go to \(unit)"
+        alert.informativeText = "\(unit) number (1–\(max(1, limit))):"
+        alert.addButton(withTitle: "Go")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
+        field.placeholderString = "1"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let value = Int(field.stringValue.trimmingCharacters(in: .whitespaces)),
+              value >= 1 else { return }
+        goToLine(value)
+    }
+
+    // MARK: Grid mutations
+    //
+    // Every edit to the table funnels through here: mutate the rows, re-serialize
+    // the document text, mark it modified, register one undo step, and flag a
+    // structure change when the table's shape moved. Row insert / duplicate /
+    // move are one-liners on top of it.
+
+    func mutateCSV(actionName: String, _ mutate: (inout [CSVRow]) -> Void) {
+        guard let delim = csvDelimiter else { return }
+        let previousRows = csvRows
+        let previousText = text
+
+        var working = csvRows
+        mutate(&working)
+        // CSVRow identity is a UUID, so compare the content that actually matters.
+        guard working.map(\.cells) != previousRows.map(\.cells) else { return }
+
+        csvRows    = working
+        text       = serializeDelimited(working, delimiter: delim)
+        isModified = true
+
+        let shapeChanged = working.count != previousRows.count
+            || working.map(\.cells.count).max() != previousRows.map(\.cells.count).max()
+            || working.first?.cells != previousRows.first?.cells
+        if shapeChanged { csvStructureVersion += 1 }
+
+        registerCSVUndo(rows: previousRows, text: previousText,
+                        structureChanged: shapeChanged, actionName: actionName)
+    }
+
+    private func registerCSVUndo(rows: [CSVRow], text previousText: String,
+                                 structureChanged: Bool, actionName: String) {
+        guard let undoManager = NSApp.keyWindow?.undoManager else { return }
+        undoManager.registerUndo(withTarget: self) { doc in
+            let redoRows = doc.csvRows
+            let redoText = doc.text
+            doc.csvRows    = rows
+            doc.text       = previousText
+            doc.isModified = true
+            if structureChanged { doc.csvStructureVersion += 1 }
+            doc.registerCSVUndo(rows: redoRows, text: redoText,
+                                structureChanged: structureChanged, actionName: actionName)
+        }
+        undoManager.setActionName(actionName)
+    }
+
+    // MARK: Encoding / line endings
+
+    /// Changes the encoding the next save will use. Marks the document modified
+    /// so ⌘S is obviously the thing that applies it.
+    func setEncoding(_ encoding: FileEncoding) {
+        guard fileEncoding != encoding else { return }
+        fileEncoding = encoding
+        if fileURL != nil { isModified = true }
+    }
+
+    func setLineEnding(_ ending: LineEnding) {
+        guard lineEnding != ending else { return }
+        lineEnding = ending
+        if fileURL != nil { isModified = true }
+    }
+
+    // MARK: Printing
+
+    func printDocument(window: NSWindow?) {
+        if csvIsTableView && !csvRows.isEmpty {
+            DocumentPrinter.printGrid(rows: csvRows, showHeaders: csvShowHeaders,
+                                      name: displayName, window: window)
+        } else {
+            DocumentPrinter.printText(text, name: displayName,
+                                      fontSize: fontSize, window: window)
+        }
     }
 
     // MARK: Find
@@ -219,6 +394,12 @@ final class NotepadDocument {
     }
 
     func replaceCurrent() {
+        // Replacing one match at a time in the grid needs the table's match
+        // ordering, which lives in the table coordinator — until that moves into
+        // the document, single replace stays a text-mode operation. It used to
+        // edit `text` behind the grid's back, and the next cell edit re-serialized
+        // csvRows over the top and silently threw the replacement away.
+        guard !isGridActive else { return }
         guard !findText.isEmpty, let range = findHighlightRange,
               range.upperBound <= (text as NSString).length,
               let swiftRange = Range(range, in: text) else { findNext(); return }
@@ -232,8 +413,14 @@ final class NotepadDocument {
         findNext()
     }
 
+    /// True when the table is the visible, authoritative view of the document.
+    /// Editing `text` directly while this holds loses the edit on the next
+    /// grid mutation, which re-serializes from `csvRows`.
+    var isGridActive: Bool { csvIsTableView && !csvRows.isEmpty }
+
     func replaceAll() {
         guard !findText.isEmpty else { return }
+        if isGridActive { replaceAllInGrid(); return }
         var opts: NSString.CompareOptions = []
         if !findCaseSensitive { opts.insert(.caseInsensitive) }
         let ns = text as NSString
@@ -241,6 +428,24 @@ final class NotepadDocument {
                                               range: NSRange(location: 0, length: ns.length))
         if result != text { text = result; isModified = true }
         findHighlightRange = nil
+    }
+
+    /// Replace All over the grid's cells, so the table and the document text stay
+    /// in agreement. Goes through mutateCSV, so it is a single undo step.
+    private func replaceAllInGrid() {
+        let opts: String.CompareOptions = findCaseSensitive ? [] : [.caseInsensitive]
+        let needle = findText
+        let replacement = replaceText
+        mutateCSV(actionName: "Replace All") { rows in
+            for row in rows.indices {
+                for cell in rows[row].cells.indices {
+                    let value = rows[row].cells[cell]
+                    guard value.range(of: needle, options: opts) != nil else { continue }
+                    rows[row].cells[cell] = value.replacingOccurrences(
+                        of: needle, with: replacement, options: opts, range: nil)
+                }
+            }
+        }
     }
 
     // MARK: Pretty Print / Restore Original (toggle)
@@ -288,6 +493,8 @@ final class NotepadDocument {
         language = .plain
         isPrettyPrinted = false
         originalText = nil
+        fileEncoding = .utf8
+        lineEnding = .lf
     }
 
     func openDocument() {
@@ -327,46 +534,79 @@ final class NotepadDocument {
 
     func loadFile(from url: URL) {
         do {
-            let raw  = try String(contentsOf: url, encoding: .utf8)
-            let lang = Language.detect(from: url)
-
-            // CSV/TSV: parse on background thread so large files don't block UI
-            if lang.isTabular, let delim = lang.tabularDelimiter {
-                parseCSVInBackground(raw, delimiter: delim, showTable: true)
-            } else {
-                csvDelimiter = nil; csvRows = []; csvIsTableView = false; csvIsLoading = false
-            }
-
-            // Pretty-print for JSON/XML/HTML
-            if lang.canPrettyPrint, let formatted = prettyPrint(text: raw, language: lang) {
-                originalText = raw; text = formatted; isPrettyPrinted = true
-            } else {
-                originalText = nil; text = raw; isPrettyPrinted = false
-            }
-
+            let loaded = try TextFileIO.read(url)
+            apply(loaded, url: url)
             fileURL      = url
             bookmarkData = SessionManager.shared.makeBookmark(for: url)
             isModified   = false
-            language     = lang
-            csvFindMatchIndex = 0
+            language     = Language.detect(from: url)
             RecentFilesManager.shared.add(url)
         } catch {
             presentError("Could not open \"\(url.lastPathComponent)\".\n\(error.localizedDescription)")
         }
     }
 
-    private func writeFile(to url: URL) {
+    /// Re-reads the file forcing a particular encoding, for the occasional file
+    /// whose bytes are ambiguous enough that detection picks the wrong one.
+    func reopen(with encoding: FileEncoding) {
+        guard let url = fileURL else { return }
+        guard !isModified || confirmDiscard() else { return }
         do {
-            try text.write(to: url, atomically: true, encoding: .utf8)
-            fileURL = url
-            bookmarkData = SessionManager.shared.makeBookmark(for: url)
-            isModified = false
-            language = Language.detect(from: url)
-            isPrettyPrinted = false
-            RecentFilesManager.shared.add(url)
+            let loaded = try TextFileIO.read(url, forcing: encoding)
+            apply(loaded, url: url)
+            fileEncoding = encoding      // honour the explicit choice, not detection
+            isModified   = false
+            language     = Language.detect(from: url)
+        } catch {
+            presentError("Could not read \"\(url.lastPathComponent)\" as \(encoding.displayName).")
+        }
+    }
+
+    private func writeFile(to url: URL) {
+        // An empty buffer landing on a file that has content is nearly always a
+        // bug rather than an intent — it is exactly what the old "read as UTF-8,
+        // fall back to empty string" path produced. Make the user say so.
+        if text.isEmpty, TextFileIO.hasContent(at: url) {
+            let alert = NSAlert.make()
+            alert.messageText = "Replace \"\(url.lastPathComponent)\" with an empty document?"
+            alert.informativeText = "The file on disk still has content. Saving now erases it."
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Replace")
+            alert.alertStyle = .warning
+            guard alert.runModal() == .alertSecondButtonReturn else { return }
+        }
+
+        do {
+            try TextFileIO.write(text, to: url, encoding: fileEncoding, lineEnding: lineEnding)
+        } catch TextFileError.unrepresentable(let encoding) {
+            // The buffer picked up characters the file's own encoding can't hold
+            // (a pasted em-dash into a Windows-1252 CSV, say). Offer the only
+            // lossless way out rather than writing "?" over them.
+            let alert = NSAlert.make()
+            alert.messageText = "\"\(url.lastPathComponent)\" can't be saved as \(encoding.displayName)."
+            alert.informativeText = "Some characters in the document aren't available in that encoding. Saving as UTF-8 keeps all of them."
+            alert.addButton(withTitle: "Save as UTF-8")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            fileEncoding = .utf8
+            do {
+                try TextFileIO.write(text, to: url, encoding: .utf8, lineEnding: lineEnding)
+            } catch {
+                presentError("Could not save \"\(url.lastPathComponent)\".\n\(error.localizedDescription)")
+                return
+            }
         } catch {
             presentError("Could not save \"\(url.lastPathComponent)\".\n\(error.localizedDescription)")
+            return
         }
+
+        fileURL = url
+        bookmarkData = SessionManager.shared.makeBookmark(for: url)
+        isModified = false
+        language = Language.detect(from: url)
+        isPrettyPrinted = false
+        RecentFilesManager.shared.add(url)
     }
 
     private func confirmDiscard() -> Bool {
@@ -749,6 +989,10 @@ struct FindReplaceBar: View {
                 charButton("↵") { document.replaceText += "\n" }
                 charButton("⇥") { document.replaceText += "\t" }
                 Button("Replace") { document.replaceCurrent() }
+                    .disabled(document.isGridActive)
+                    .help(document.isGridActive
+                          ? "Single replace isn't available in grid view — use All"
+                          : "Replace this match")
                 Button("All") { document.replaceAll() }
                     .help("Replace All")
                 Toggle("Case", isOn: $document.findCaseSensitive)
@@ -864,6 +1108,10 @@ struct StatusBarView: View {
                 pill("Rows: \(max(0, document.csvRows.count - 1))")
                 Divider().frame(height: 12)
                 pill("Columns: \(document.csvRows.first?.cells.count ?? 0)")
+                if document.csvSelectedRowCount > 0 {
+                    Divider().frame(height: 12)
+                    pill("Selected: \(document.csvSelectedRowCount)")
+                }
                 if !document.csvSortKeys.isEmpty {
                     Divider().frame(height: 12)
                     Button(action: { document.csvSortKeys = [] }) {
@@ -875,6 +1123,11 @@ struct StatusBarView: View {
                     .buttonStyle(.plain)
                     .help("Clear all sorting")
                 }
+                Divider().frame(height: 12)
+                // Shown in grid mode too — CSVs are precisely the files that arrive
+                // as Windows-1252 with CRLF, and this is where the user is looking.
+                pill("\(document.fileEncoding.badge) · \(document.lineEnding.badge)")
+                    .help("Text encoding and line endings used when saving")
             } else {
                 // ── Text mode: word / char / line counts ──────────────────
                 pill("Words: \(words)")
@@ -891,6 +1144,12 @@ struct StatusBarView: View {
                     Divider().frame(height: 12)
                     Text(languageBadge).foregroundStyle(formatColor).padding(.horizontal, 8)
                 }
+                Divider().frame(height: 12)
+                // What this document will be written back as. Worth showing: a file
+                // that came in as Windows-1252 with CRLF goes back out that way, and
+                // silently changing either is how text files get mangled.
+                pill("\(document.fileEncoding.badge) · \(document.lineEnding.badge)")
+                    .help("Text encoding and line endings used when saving")
             }
 
             Spacer()
@@ -923,8 +1182,8 @@ struct StatusBarView: View {
                 ) { document.wordWrap.toggle() }
             }
 
-            // ── Zoom (text mode only) ──────────────────────────────────────
-            if !inTableView {
+            // ── Zoom (both modes — the grid is monospaced and scales too) ──
+            do {
                 Divider().frame(height: 12)
                 HStack(spacing: 0) {
                     Button { document.fontSize = max(9,  document.fontSize - 1) } label: {

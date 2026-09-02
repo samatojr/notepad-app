@@ -1,6 +1,6 @@
 #!/bin/bash
-# Finish the Notepad 3.3 release: notarize -> staple -> re-zip -> EdDSA sign ->
-# appcast entry -> (optionally) publish to GitHub.
+# Finish a Notepad release: notarize -> staple -> re-zip -> EdDSA sign -> build and
+# notarize the DMG -> appcast entry -> (optionally) publish to GitHub.
 #
 # The Release build is already made and Developer ID signed at /tmp/np-release.
 # The one thing Claude could not do is notarization: it needs your Apple ID and an
@@ -16,15 +16,19 @@
 
 set -euo pipefail
 
-VERSION="3.3"
-BUILD="28"
+VERSION="3.4"
+BUILD="29"
 REPO="samatojr/notepad-app"
 DIR="/tmp/np-release"
 APP="$DIR/Notepad.app"
 ZIP="$DIR/Notepad_${VERSION}.zip"
+DMG="$DIR/Notepad_${VERSION}.dmg"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APPCAST="$PROJECT_DIR/appcast.xml"
-SIGN_UPDATE="$HOME/Library/Developer/Xcode/DerivedData/Notepad-cmijwvbugyfqcuaccktkttvknabf/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
+# DerivedData directory names change whenever the project is relocated, so find the
+# tool rather than hard-coding last release's path.
+SIGN_UPDATE="$(find "$HOME/Library/Developer/Xcode/DerivedData" \
+    -path '*/artifacts/sparkle/Sparkle/bin/sign_update' -type f 2>/dev/null | head -1)"
 CERT="Developer ID Application: St. Joseph By-The-Sea High School (HHW8S56U26)"
 SPARKLE_FW="$APP/Contents/Frameworks/Sparkle.framework"
 SPARKLE_V="$SPARKLE_FW/Versions/B"
@@ -90,7 +94,23 @@ LENGTH=$(stat -f%z "$ZIP")
 echo "   edSignature: $ED_SIG"
 echo "   length:      $LENGTH"
 
-echo "==> 6/6 Writing appcast entry"
+echo "==> 6/7 Building, notarizing and stapling the DMG"
+# 3.3 shipped without one; fresh installs want the branded installer back.
+rm -f "$DMG"
+bash "$PROJECT_DIR/make_dmg.sh" "$APP" "$VERSION" "$DIR" >/dev/null
+[ -f "$DMG" ] || { echo "✗ DMG was not produced"; exit 1; }
+DMG_OUT=$(xcrun notarytool submit "$DMG" --keychain-profile "notarytool" --wait 2>&1)
+DMG_STATUS=$(echo "$DMG_OUT" | sed -n 's/^ *status: *//p' | tail -1)
+if [ "$DMG_STATUS" != "Accepted" ]; then
+    echo "✗ DMG notarization failed (status: ${DMG_STATUS:-unknown})"
+    echo "$DMG_OUT" | head -20
+    exit 1
+fi
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
+echo "   ✓ DMG notarized and stapled ($(stat -f%z "$DMG") bytes)"
+
+echo "==> 7/7 Writing appcast entry"
 PUBDATE=$(date -u "+%a, %d %b %Y %H:%M:%S +0000")
 ITEM="        <item>
             <title>${VERSION}</title>
@@ -99,14 +119,16 @@ ITEM="        <item>
             <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
             <description><![CDATA[
                 <ul>
-                    <li>Fixed a CSV bug where a quote or inch mark (5\" pipe) merged rows and could corrupt the file on save.</li>
-                    <li>Quitting with unsaved changes now prompts to save instead of discarding them.</li>
-                    <li>CSV and TSV files now open from Finder, and opening a file no longer silently does nothing.</li>
-                    <li>Launch no longer opens several blank windows.</li>
-                    <li>Paste from Google Sheets now grows the grid instead of dropping extra rows.</li>
-                    <li>Save As keeps the file's own extension instead of forcing .txt.</li>
-                    <li>Restored tabs come back in the order you left them.</li>
-                    <li>Faster typing in large JSON and other big files.</li>
+                    <li>Files that aren't UTF-8 — a spreadsheet exported from Excel on Windows, say — now open properly instead of coming up blank. Saving keeps the file's original encoding and line endings.</li>
+                    <li>Saving an empty document over a file that still has content now asks first.</li>
+                    <li>Opening a file that isn't text is refused, rather than filling the window with garbage you could save over the original.</li>
+                    <li>Printing works. ⌘P prints the document, and a CSV prints as a real table with the column headings repeated on every page.</li>
+                    <li>Go to Line (⌘L) jumps to a line number, or to a row when a CSV is showing as a grid.</li>
+                    <li>The grid now uses the same monospaced font as the editor, so figures line up. Columns align themselves: numbers to the right, short entries like Yes/No centred, text to the left.</li>
+                    <li>Zoom (⌘+ and ⌘−) now works in grid view as well as the editor.</li>
+                    <li>Undo works in the grid — cell edits, row deletions and pastes can all be taken back.</li>
+                    <li>Insert Row and Duplicate Row added to the grid's right-click menu.</li>
+                    <li>Replace All now works in grid view instead of quietly throwing the replacements away.</li>
                 </ul>
             ]]></description>
             <pubDate>${PUBDATE}</pubDate>
@@ -119,7 +141,7 @@ ITEM="        <item>
         </item>"
 
 cp "$APPCAST" "$APPCAST.bak"
-python3 - "$APPCAST" "$ITEM" <<'PY'
+python3 - "$APPCAST" "$ITEM" "$BUILD" <<'PY'
 import sys
 path, item = sys.argv[1], sys.argv[2]
 import re
@@ -128,12 +150,13 @@ xml = open(path).read()
 # byte-reproducible, so every re-run yields a new zip with a new length and signature —
 # skipping left the appcast advertising a signature for a zip that no longer existed,
 # which makes Sparkle reject the update on every client.
+build = sys.argv[3]
 pattern = re.compile(
-    r"[ \t]*<item>(?:(?!</item>).)*?<sparkle:version>28</sparkle:version>.*?</item>\n?",
+    r"[ \t]*<item>(?:(?!</item>).)*?<sparkle:version>" + build + r"</sparkle:version>.*?</item>\n?",
     re.S)
 xml, n = pattern.subn("", xml)
 if n:
-    print(f"   replaced {n} stale entry/entries for build 28")
+    print(f"   replaced {n} stale entry/entries for this build")
 marker = "        <item>"
 if marker in xml:
     xml = xml.replace(marker, item + "\n" + marker, 1)
@@ -146,6 +169,7 @@ PY
 echo
 echo "Prepared:"
 echo "  $ZIP  ($LENGTH bytes, notarized + stapled)"
+echo "  $DMG  ($(stat -f%z "$DMG") bytes, notarized + stapled)"
 echo "  $APPCAST  (backup at $APPCAST.bak)"
 
 if [ "${1:-}" != "--publish" ]; then
@@ -161,19 +185,31 @@ echo "==> Publishing to GitHub"
 TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | git credential-osxkeychain get | sed -n 's/^password=//p')
 [ -n "$TOKEN" ] || { echo "✗ No GitHub credential in Keychain; upload manually."; exit 1; }
 
+BODY_JSON=$(python3 -c "
+import json, sys
+print(json.dumps({
+    'tag_name': 'v${VERSION}',
+    'name': 'Notepad ${VERSION}',
+    'body': open('${DIR}/release-notes.md').read()
+}))")
 REL=$(curl -sS -X POST "https://api.github.com/repos/${REPO}/releases" \
     -H "Authorization: token ${TOKEN}" \
     -H "Content-Type: application/json" \
-    -d "{\"tag_name\":\"v${VERSION}\",\"name\":\"Notepad ${VERSION}\",\"body\":\"Bug-fix release. See appcast for details.\"}")
+    -d "$BODY_JSON")
 UPLOAD_URL=$(echo "$REL" | python3 -c "import sys,json; print(json.load(sys.stdin).get('upload_url','').split('{')[0])")
 [ -n "$UPLOAD_URL" ] || { echo "✗ Release creation failed:"; echo "$REL" | head -20; exit 1; }
 
 curl -sS -X POST "${UPLOAD_URL}?name=Notepad_${VERSION}.zip" \
     -H "Authorization: token ${TOKEN}" \
     -H "Content-Type: application/octet-stream" \
-    --data-binary @"$ZIP" >/dev/null && echo "✓ asset uploaded"
+    --data-binary @"$ZIP" >/dev/null && echo "✓ zip uploaded (Sparkle auto-update)"
+
+curl -sS -X POST "${UPLOAD_URL}?name=Notepad_${VERSION}.dmg" \
+    -H "Authorization: token ${TOKEN}" \
+    -H "Content-Type: application/x-apple-diskimage" \
+    --data-binary @"$DMG" >/dev/null && echo "✓ dmg uploaded (manual install)"
 
 git -C "$PROJECT_DIR" add appcast.xml Info.plist Notepad.xcodeproj/project.pbxproj Notepad/*.swift finish_release.sh
-git -C "$PROJECT_DIR" commit -m "Notepad v${VERSION} — CSV corruption, data-loss and window fixes"
+git -C "$PROJECT_DIR" commit -F "$DIR/commit-message.txt"
 git -C "$PROJECT_DIR" push origin main
 echo "✓ published — clients will pick up ${VERSION} on their next update check"

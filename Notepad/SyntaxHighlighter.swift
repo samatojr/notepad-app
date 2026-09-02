@@ -44,6 +44,86 @@ nonisolated struct CSVRow: Identifiable, Sendable {
     var cells: [String]
 }
 
+// MARK: - Column Alignment Inference
+
+/// How a grid column should be aligned, inferred from the values it holds.
+/// Shared by the on-screen table and the printer so a printed sheet matches
+/// what was on screen.
+enum ColumnAlignment {
+    case leading    // text
+    case center     // short codes — Y/N, M/F, USA
+    case trailing   // numbers
+
+    var textAlignment: NSTextAlignment {
+        switch self {
+        case .leading:  return .left
+        case .center:   return .center
+        case .trailing: return .right
+        }
+    }
+}
+
+/// Share of non-empty cells that must agree before a column takes on a
+/// non-default alignment. Matches the ratio the auto-grid paste detector uses.
+private let columnAlignmentThreshold = 0.8
+
+/// Cells this short read as codes rather than prose — "Y", "No", "USA".
+private let shortCellLength = 3
+
+/// Infers alignment from a column's values.
+///
+/// Numeric beats short: a column of 1/0 flags is still a column of numbers, and
+/// right-aligning it keeps the digits under each other. Empty cells are ignored
+/// entirely — a column that is mostly blank shouldn't read as "short".
+nonisolated func inferColumnAlignment(_ values: [String]) -> ColumnAlignment {
+    var populated = 0
+    var numeric   = 0
+    var short     = 0
+
+    for value in values {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { continue }
+        populated += 1
+        if looksNumeric(trimmed)                { numeric += 1 }
+        if trimmed.count <= shortCellLength     { short   += 1 }
+    }
+
+    guard populated > 0 else { return .leading }
+    let total = Double(populated)
+    if Double(numeric) / total >= columnAlignmentThreshold { return .trailing }
+    if Double(short)   / total >= columnAlignmentThreshold { return .center }
+    return .leading
+}
+
+/// Lenient numeric test for real spreadsheet exports: tolerates a leading
+/// currency symbol, thousands separators, a trailing percent sign, and
+/// parenthesised negatives like "(1,200.00)" that accounting exports produce.
+nonisolated func looksNumeric(_ value: String) -> Bool {
+    var text = value
+
+    if text.hasPrefix("("), text.hasSuffix(")") {
+        text = String(text.dropFirst().dropLast())
+    }
+    if let first = text.first, "$€£¥".contains(first) {
+        text = String(text.dropFirst())
+    }
+    if text.hasSuffix("%") { text = String(text.dropLast()) }
+    text = text.replacingOccurrences(of: ",", with: "")
+               .trimmingCharacters(in: .whitespaces)
+
+    guard !text.isEmpty else { return false }
+
+    // A leading zero followed by another digit means an identifier, not a
+    // quantity: student IDs, zip codes and account numbers all look like this,
+    // and they belong on the left with the other labels. "0" and "0.89" are
+    // still numbers.
+    var digits = Substring(text)
+    if digits.first == "-" || digits.first == "+" { digits = digits.dropFirst() }
+    if digits.first == "0", digits.dropFirst().first?.isNumber == true { return false }
+
+    return Double(text) != nil
+}
+
 // MARK: - Delimited File Parsing & Serialization
 
 /// RFC 4180-compliant parser. Strips quotes for display; never touches document.text.
