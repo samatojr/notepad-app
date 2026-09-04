@@ -127,6 +127,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Under test there is nothing worth persisting, and both halves of this
+        // method are actively harmful: the modal alert would hang the run, and
+        // the save would replace the user's real session with an empty one.
+        if TestEnvironment.isRunningUnitTests { return .terminateNow }
         // Prompt for every document with unsaved changes. Without this, quitting
         // silently discarded edits to any file-backed document: sessionState only
         // caches text for untitled docs, so restore re-read the stale copy on disk.
@@ -213,10 +217,17 @@ struct NotepadApp: App {
         // and a "clean" launch still came up with several blank Untitled windows.
         // Registering rather than setting keeps this out of the saved preferences.
         UserDefaults.standard.register(defaults: ["NSQuitAlwaysKeepsWindows": false])
-        SessionManager.shared.loadAndEnqueue()
-        SessionManager.shared.clearClosedTabs()
+        // A test run launches this very app (the test bundle is injected into it),
+        // so it must not touch the real session: loadAndEnqueue would reopen the
+        // user's windows and clearClosedTabs writes straight to their defaults.
+        if !TestEnvironment.isRunningUnitTests {
+            SessionManager.shared.loadAndEnqueue()
+            SessionManager.shared.clearClosedTabs()
+        }
         updaterController = SPUStandardUpdaterController(
-            startingUpdater: true,
+            // Leave the updater stopped under test — a background check firing
+            // mid-run is noise at best and a network dependency at worst.
+            startingUpdater: !TestEnvironment.isRunningUnitTests,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )

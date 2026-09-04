@@ -98,11 +98,29 @@ nonisolated func inferColumnAlignment(_ values: [String]) -> ColumnAlignment {
 /// Lenient numeric test for real spreadsheet exports: tolerates a leading
 /// currency symbol, thousands separators, a trailing percent sign, and
 /// parenthesised negatives like "(1,200.00)" that accounting exports produce.
+///
+/// Defined in terms of `numericValue` so the selection summary in the status bar
+/// adds up exactly the cells the grid right-aligns. Two separate notions of
+/// "is this a number" would eventually disagree, and a column that displays as
+/// numeric but refuses to total is a bug report.
 nonisolated func looksNumeric(_ value: String) -> Bool {
+    numericValue(value) != nil
+}
+
+/// The number a cell holds, or nil when it isn't one. Accepts exactly what
+/// `looksNumeric` accepts.
+///
+/// Accounting parentheses yield a negative. A trailing percent sign is dropped
+/// rather than divided by 100 — the status bar totals what is on screen, so a
+/// column of "12%" and "8%" sums to 20, which is what someone reading those
+/// cells expects to see.
+nonisolated func numericValue(_ value: String) -> Double? {
     var text = value
+    var parenthesisedNegative = false
 
     if text.hasPrefix("("), text.hasSuffix(")") {
         text = String(text.dropFirst().dropLast())
+        parenthesisedNegative = true
     }
     if let first = text.first, "$€£¥".contains(first) {
         text = String(text.dropFirst())
@@ -111,7 +129,7 @@ nonisolated func looksNumeric(_ value: String) -> Bool {
     text = text.replacingOccurrences(of: ",", with: "")
                .trimmingCharacters(in: .whitespaces)
 
-    guard !text.isEmpty else { return false }
+    guard !text.isEmpty else { return nil }
 
     // A leading zero followed by another digit means an identifier, not a
     // quantity: student IDs, zip codes and account numbers all look like this,
@@ -119,9 +137,10 @@ nonisolated func looksNumeric(_ value: String) -> Bool {
     // still numbers.
     var digits = Substring(text)
     if digits.first == "-" || digits.first == "+" { digits = digits.dropFirst() }
-    if digits.first == "0", digits.dropFirst().first?.isNumber == true { return false }
+    if digits.first == "0", digits.dropFirst().first?.isNumber == true { return nil }
 
-    return Double(text) != nil
+    guard let number = Double(text) else { return nil }
+    return parenthesisedNegative ? -abs(number) : number
 }
 
 // MARK: - Delimited File Parsing & Serialization

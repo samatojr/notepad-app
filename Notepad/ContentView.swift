@@ -38,6 +38,13 @@ final class NotepadDocument {
     var csvShowHeaders:   Bool       = true  // show column header row in table view (on by default)
     var csvSortKeys: [CSVSortKey] = []   // ordered: first = primary sort
     var csvSelectedRowCount: Int = 0     // published by the grid for the status bar
+    /// WHICH cells the grid has selected, as csvRows indices and a column range.
+    /// Deliberately raw coordinates rather than a computed summary: the status
+    /// bar derives the arithmetic from these against the live cell values, so it
+    /// stays correct after an undo without anything writing derived state back
+    /// into the document.
+    var csvSelectionRows: [Int] = []
+    var csvSelectionColumns: ClosedRange<Int>? = nil
     /// Bumped whenever a grid mutation changes the table's shape (row count,
     /// column count, header text) so the table rebuilds its columns instead of
     /// merely reloading — a plain reload would keep stale titles and widths.
@@ -205,7 +212,7 @@ final class NotepadDocument {
         // Table view state is per-document too — leaving it set meant the next CSV
         // opened in this tab inherited the previous file's sorting and toggles.
         csvSortKeys = []; csvShowRowNumbers = false; csvShowHeaders = true
-        csvSelectedRowCount = 0
+        csvSelectedRowCount = 0; csvSelectionRows = []; csvSelectionColumns = nil
         fileEncoding = .utf8; lineEnding = .lf
     }
 
@@ -1101,6 +1108,58 @@ struct StatusBarView: View {
 
     private var inTableView: Bool { document.csvIsTableView && !document.csvRows.isEmpty }
 
+    /// Arithmetic over the current selection, computed from the LIVE cell values
+    /// each time the status bar renders. Deriving it here rather than caching it
+    /// on the document means an undo that restores different values into the same
+    /// cells shows the right total immediately.
+    private var selectionSummary: SelectionSummary? {
+        guard let columns = document.csvSelectionColumns,
+              !document.csvSelectionRows.isEmpty else { return nil }
+        let rows = document.csvRows
+        // A whole-column selection in a very large file would make this run over
+        // every row on each render. Past this point report the size only.
+        let cellCount = document.csvSelectionRows.count * columns.count
+        guard cellCount <= Self.maxSummarizedCells else {
+            var partial = SelectionSummary()
+            partial.cellCount = cellCount
+            return partial
+        }
+        var cells: [[String]] = []
+        cells.reserveCapacity(document.csvSelectionRows.count)
+        for index in document.csvSelectionRows where rows.indices.contains(index) {
+            let source = rows[index].cells
+            cells.append(columns.map { $0 < source.count ? source[$0] : "" })
+        }
+        return summarize(cells)
+    }
+
+    private static let maxSummarizedCells = 200_000
+
+    /// "Selected: 12 cells" — or just the count for a single cell.
+    private func selectionLabel(_ summary: SelectionSummary) -> String {
+        summary.cellCount == 1 ? "Selected: 1 cell"
+                               : "Selected: \(summary.cellCount) cells"
+    }
+
+    /// Sum and average of the numeric part of the selection, the way a
+    /// spreadsheet's status bar reports it.
+    private func arithmeticLabel(_ summary: SelectionSummary) -> String {
+        var parts = ["Sum: \(formatted(summary.sum))"]
+        if let average = summary.average, summary.numericCount > 1 {
+            parts.append("Avg: \(formatted(average))")
+        }
+        return parts.joined(separator: "   ")
+    }
+
+    /// Trims the trailing ".0" off whole numbers so a column of integers reads
+    /// as integers, while keeping real decimals readable.
+    private func formatted(_ value: Double) -> String {
+        if value == value.rounded(), abs(value) < 1e15 {
+            return String(format: "%.0f", value)
+        }
+        return String(format: "%g", value)
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             if inTableView {
@@ -1108,9 +1167,13 @@ struct StatusBarView: View {
                 pill("Rows: \(max(0, document.csvRows.count - 1))")
                 Divider().frame(height: 12)
                 pill("Columns: \(document.csvRows.first?.cells.count ?? 0)")
-                if document.csvSelectedRowCount > 0 {
+                if let summary = selectionSummary, summary.cellCount > 0 {
                     Divider().frame(height: 12)
-                    pill("Selected: \(document.csvSelectedRowCount)")
+                    pill(selectionLabel(summary))
+                    if summary.hasNumbers {
+                        Divider().frame(height: 12)
+                        pill(arithmeticLabel(summary))
+                    }
                 }
                 if !document.csvSortKeys.isEmpty {
                     Divider().frame(height: 12)
