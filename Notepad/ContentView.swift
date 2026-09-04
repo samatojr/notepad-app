@@ -670,6 +670,58 @@ final class DocumentRegistry {
 
     func allDocuments() -> [NotepadDocument] { Array(documents.values) }
 
+    /// Experiment: can a SwiftUI WindowGroup window actually be closed by us?
+    /// Clears away the windows an open leaves behind.
+    ///
+    /// Opening a file spawns an extra window whether the app wants one or not:
+    /// SwiftUI's WindowGroup answers the system's open-document event by creating
+    /// one, and does so BEFORE application(_:open:) is called — traced, two
+    /// document initializers run ahead of the delegate. The app then fills a
+    /// different window with the file and that one is left blank. Repeat per open
+    /// and blank windows pile up, which is the reported symptom.
+    ///
+    /// Not preventable from here: SwiftUI never consults
+    /// applicationShouldOpenUntitledFile, and .handlesExternalEvents(matching: [])
+    /// does not suppress it either — both were tried and traced. So this tidies up
+    /// after the framework instead.
+    ///
+    /// Deliberately conservative. A window is only closed when it is VISIBLE, is
+    /// not the one that just took the file, and is either completely untouched
+    /// (no file, no text, no edits) or an unmodified second view of a file already
+    /// on screen. Anything typed, edited or unsaved is therefore untouchable, and
+    /// the last remaining window is always kept.
+    func closeBlankWindows(keeping keeper: NotepadDocument?) {
+        // Only windows the user can actually see. The registry also holds windows
+        // that were created but never displayed, and counting those made a VISIBLE
+        // window look like the duplicate of an invisible one — which closed the
+        // window the user was looking at.
+        guard let bound = windowBindings.keyEnumerator().allObjects as? [NSWindow] else { return }
+        let windows = bound.filter { $0.isVisible }
+        var remaining = windows.count
+        // A file already shown elsewhere makes a second window for it redundant.
+        // The keeper is recorded first so it is never the one discarded.
+        var seenURLs = Set<URL>()
+        if let url = keeper?.fileURL { seenURLs.insert(url) }
+
+        for window in windows {
+            guard remaining > 1, let doc = windowBindings.object(forKey: window), doc !== keeper
+            else { continue }
+
+            let isBlank = doc.fileURL == nil && doc.text.isEmpty && !doc.isModified
+            var isRedundantDuplicate = false
+            if let url = doc.fileURL, !doc.isModified {
+                // Unmodified only: a second window on the same file with edits in
+                // it is someone's work, not litter.
+                isRedundantDuplicate = !seenURLs.insert(url).inserted
+            } else if let url = doc.fileURL {
+                seenURLs.insert(url)
+            }
+            guard isBlank || isRedundantDuplicate else { continue }
+            window.close()
+            remaining -= 1
+        }
+    }
+
     // MARK: Window bindings
     //
     // Which document lives in which window. Weak on both sides so a closed
@@ -893,6 +945,10 @@ struct ContentView: View {
             // NOT opening a duplicate is the part that matters.
             DocumentRegistry.shared.window(for: existing)?.makeKeyAndOrderFront(nil)
             NSApp.activate()
+            // The window spawned for this open has nothing to show now that the
+            // file is already on screen — sweep it too, or repeated opens of the
+            // same file pile blanks up one at a time.
+            sweepBlankWindows(keeping: existing)
             return
         }
         if document.text.isEmpty && !document.isModified && document.fileURL == nil {
@@ -900,6 +956,18 @@ struct ContentView: View {
         } else {
             PendingURLManager.shared.pendingURL = url
             openNewTab()
+        }
+        sweepBlankWindows(keeping: document)
+    }
+
+    /// Clears away the window SwiftUI spawns for an open that the app then fills
+    /// itself. Twice, because SwiftUI is not finished making windows when the
+    /// first pass runs; both passes are idempotent.
+    private func sweepBlankWindows(keeping keeper: NotepadDocument?) {
+        for delay in [0.5, 1.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                DocumentRegistry.shared.closeBlankWindows(keeping: keeper)
+            }
         }
     }
 
