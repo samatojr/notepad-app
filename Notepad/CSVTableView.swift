@@ -75,6 +75,31 @@ final class GridHeaderView: NSTableHeaderView {
         }
         super.mouseDown(with: event)
     }
+
+    /// A right-click on the header shows the same menu the grid does.
+    ///
+    /// NSTableHeaderView is its own view, so a right-click here never reaches the
+    /// table's `menu(for:)`. Without this the header had no menu at all and the
+    /// column operations were only reachable by selecting the column and then
+    /// right-clicking down in the data — which is not where anyone looks for them.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        let index = column(at: point)
+        guard let table = tableView as? CopyableTableView,
+              index >= 0, index < table.tableColumns.count else { return nil }
+
+        let identifier = table.tableColumns[index].identifier.rawValue
+        guard identifier != "col_rownum",
+              let suffix = identifier.split(separator: "_").last,
+              let dataColumn = Int(suffix) else { return nil }
+
+        // Point at a column that is not selected and the menu should act on the
+        // one being pointed at, so select it first — the same rule the grid uses.
+        if !table.fullySelectedColumns.contains(dataColumn) {
+            table.selectColumn(dataColumn, extending: false)
+        }
+        return table.contextMenu(forColumn: dataColumn, includingRowOperations: false)
+    }
 }
 
 // MARK: - NSTableView subclass: cell-range selection, copy/cut/paste, menus
@@ -368,25 +393,38 @@ final class CopyableTableView: NSTableView {
            selectedRange?.contains(row: clickedRow, column: clickedColumn) != true {
             setSelection(anchor: GridCellAddress(row: clickedRow, column: clickedColumn))
         }
+        return contextMenu(forColumn: dataColumn(at: point), includingRowOperations: true)
+    }
 
+    /// Builds the grid's context menu.
+    ///
+    /// Shared with the column header, which reaches it through its own
+    /// `menu(for:)`: NSTableHeaderView is a separate view and a right-click there
+    /// never travels to the table, so without this the header offered no menu at
+    /// all — you had to select the column and then right-click down in the data.
+    ///
+    /// `column` is nil over the row-number gutter, where the column operations
+    /// have nothing to act on. Row operations are left out for the header, where
+    /// "Delete Row" would be about a row the user never pointed at.
+    func contextMenu(forColumn column: Int?, includingRowOperations: Bool) -> NSMenu {
         let menu = NSMenu()
-        let hasSelection = selectedRange != nil
 
-        if hasSelection {
-            addItem(to: menu, "Copy",  #selector(copy(_:)))
-            addItem(to: menu, "Cut",   #selector(cut(_:)))
+        if selectedRange != nil {
+            addItem(to: menu, "Copy", #selector(copy(_:)))
+            addItem(to: menu, "Cut",  #selector(cut(_:)))
         }
         if NSPasteboard.general.string(forType: .string) != nil {
             addItem(to: menu, "Paste", #selector(paste(_:)))
         }
 
         // ── Column operations ────────────────────────────────────────────────
-        if let clickedColumn = dataColumn(at: point) {
-            menu.addItem(.separator())
-            let columns = fullySelectedColumns
-
+        if let column {
+            menuColumn = column
+            if !menu.items.isEmpty { menu.addItem(.separator()) }
             addItem(to: menu, "Insert Column Left",  #selector(insertColumnLeft(_:)))
             addItem(to: menu, "Insert Column Right", #selector(insertColumnRight(_:)))
+
+            let columns = fullySelectedColumns
             if !columns.isEmpty {
                 let label = columns.count == 1 ? "Delete Column" : "Delete \(columns.count) Columns"
                 addItem(to: menu, label, #selector(deleteColumns(_:)))
@@ -395,23 +433,24 @@ final class CopyableTableView: NSTableView {
 
             menu.addItem(.separator())
             addItem(to: menu, "Sort by This Column", #selector(sortByColumn(_:)))
-            menuColumn = clickedColumn
         }
 
         // ── Row operations ───────────────────────────────────────────────────
-        menu.addItem(.separator())
-        addItem(to: menu, "Insert Row", #selector(insertRow(_:)))
-
-        if !selectedRowIndexes.isEmpty {
-            let count = selectedRowIndexes.count
-            addItem(to: menu, count == 1 ? "Duplicate Row" : "Duplicate \(count) Rows",
-                    #selector(duplicateRows(_:)))
+        if includingRowOperations {
             menu.addItem(.separator())
-            addItem(to: menu, count == 1 ? "Delete Row" : "Delete \(count) Rows",
-                    #selector(deleteRows(_:)))
+            addItem(to: menu, "Insert Row", #selector(insertRow(_:)))
+
+            if !selectedRowIndexes.isEmpty {
+                let count = selectedRowIndexes.count
+                addItem(to: menu, count == 1 ? "Duplicate Row" : "Duplicate \(count) Rows",
+                        #selector(duplicateRows(_:)))
+                menu.addItem(.separator())
+                addItem(to: menu, count == 1 ? "Delete Row" : "Delete \(count) Rows",
+                        #selector(deleteRows(_:)))
+            }
         }
 
-        return menu.items.isEmpty ? nil : menu
+        return menu
     }
 
     /// Column the context menu was opened over — the column operations act here
