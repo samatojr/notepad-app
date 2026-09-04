@@ -80,8 +80,15 @@ final class NotepadDocument {
         // shared load/restore helpers below can be plain methods rather than
         // three near-identical copies of the same twenty lines.
         let pendingURL = PendingURLManager.shared.pendingURL
+        // Only a session entry, never the closed-tabs buffer.
+        //
+        // This used to read `popClosed() ?? popPending()`, so EVERY new document
+        // resurrected the most recently closed tab — including one made by ⌘T.
+        // Press New Tab after closing something and a file you did not ask for
+        // appeared in it. Nothing exposes "Reopen Closed Tab" to the user, so
+        // that buffer had no purpose other than producing this.
         let restoreState: DocumentSessionState? = pendingURL == nil
-            ? (SessionManager.shared.popClosed() ?? SessionManager.shared.popPending())
+            ? SessionManager.shared.popPending()
             : nil
         sessionID = restoreState?.sessionID ?? UUID()
 
@@ -885,11 +892,11 @@ struct ContentView: View {
         .onDisappear {
             if !AppState.shared.isTerminating {
                 // Only save to closed-tabs buffer if the tab wasn't explicitly dismissed by the user
-                if !AppState.shared.isClearingSession
-                    && !document.isBeingExplicitlyClosed
-                    && (!document.text.isEmpty || document.fileURL != nil) {
-                    SessionManager.shared.pushClosed(document.sessionState(index: 0))
-                }
+                // Nothing consumes the closed-tabs buffer any more (see init),
+                // so filling it would just be writing to defaults for no reader.
+                // If "Reopen Closed Tab" is ever built, this is where it starts —
+                // but it needs an explicit command behind it, not a buffer that
+                // the next document created silently helps itself to.
                 DocumentRegistry.shared.unregister(document)
             }
         }
