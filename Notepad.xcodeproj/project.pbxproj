@@ -12,12 +12,18 @@
 
 /* Begin PBXFileReference section */
 		9B0326E02FC4FBE500653573 /* Notepad.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Notepad.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9BFEED000000000000000002 /* NotepadTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NotepadTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		9B0326E22FC4FBE500653573 /* Notepad */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Notepad;
+			sourceTree = "<group>";
+		};
+		9BFEED000000000000000003 /* NotepadTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = NotepadTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -31,6 +37,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		9BFEED000000000000000005 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -38,6 +51,7 @@
 			isa = PBXGroup;
 			children = (
 				9B0326E22FC4FBE500653573 /* Notepad */,
+				9BFEED000000000000000003 /* NotepadTests */,
 				9B0326E12FC4FBE500653573 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -46,6 +60,7 @@
 			isa = PBXGroup;
 			children = (
 				9B0326E02FC4FBE500653573 /* Notepad.app */,
+				9BFEED000000000000000002 /* NotepadTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -76,7 +91,46 @@
 			productReference = 9B0326E02FC4FBE500653573 /* Notepad.app */;
 			productType = "com.apple.product-type.application";
 		};
+		9BFEED000000000000000001 /* NotepadTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 9BFEED00000000000000000B /* Build configuration list for PBXNativeTarget "NotepadTests" */;
+			buildPhases = (
+				9BFEED000000000000000004 /* Sources */,
+				9BFEED000000000000000005 /* Frameworks */,
+				9BFEED000000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				9BFEED000000000000000007 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				9BFEED000000000000000003 /* NotepadTests */,
+			);
+			name = NotepadTests;
+			productName = NotepadTests;
+			productReference = 9BFEED000000000000000002 /* NotepadTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
+
+/* Begin PBXContainerItemProxy section */
+		9BFEED000000000000000008 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 9B0326D82FC4FBE500653573 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 9B0326DF2FC4FBE500653573;
+			remoteInfo = Notepad;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXTargetDependency section */
+		9BFEED000000000000000007 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 9B0326DF2FC4FBE500653573 /* Notepad */;
+			targetProxy = 9BFEED000000000000000008 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin PBXProject section */
 		9B0326D82FC4FBE500653573 /* Project object */ = {
@@ -88,6 +142,10 @@
 				TargetAttributes = {
 					9B0326DF2FC4FBE500653573 = {
 						CreatedOnToolsVersion = 26.5;
+					};
+					9BFEED000000000000000001 = {
+						CreatedOnToolsVersion = 26.6;
+						TestTargetID = 9B0326DF2FC4FBE500653573;
 					};
 				};
 			};
@@ -109,6 +167,7 @@
 			projectRoot = "";
 			targets = (
 				9B0326DF2FC4FBE500653573 /* Notepad */,
+				9BFEED000000000000000001 /* NotepadTests */,
 			);
 		};
 /* End PBXProject section */
@@ -121,10 +180,24 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		9BFEED000000000000000006 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		9B0326DC2FC4FBE500653573 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		9BFEED000000000000000004 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -262,7 +335,7 @@
 				CODE_SIGN_ENTITLEMENTS = Notepad/Notepad.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 29;
+				CURRENT_PROJECT_VERSION = 30;
 				DEVELOPMENT_TEAM = 6XB6JUTU68;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -275,7 +348,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 3.4;
+				MARKETING_VERSION = 3.4.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.josephsea.Notepad;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -296,7 +369,7 @@
 				CODE_SIGN_ENTITLEMENTS = Notepad/Notepad.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 29;
+				CURRENT_PROJECT_VERSION = 30;
 				DEVELOPMENT_TEAM = 6XB6JUTU68;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -309,7 +382,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 3.4;
+				MARKETING_VERSION = 3.4.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.josephsea.Notepad;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -319,6 +392,50 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		9BFEED000000000000000009 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = NO;
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6XB6JUTU68;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.josephsea.NotepadTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Notepad.app/Contents/MacOS/Notepad";
+			};
+			name = Debug;
+		};
+		9BFEED00000000000000000A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = NO;
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6XB6JUTU68;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.josephsea.NotepadTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Notepad.app/Contents/MacOS/Notepad";
 			};
 			name = Release;
 		};
@@ -339,6 +456,15 @@
 			buildConfigurations = (
 				9B0326EC2FC4FBE600653573 /* Debug */,
 				9B0326ED2FC4FBE600653573 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		9BFEED00000000000000000B /* Build configuration list for PBXNativeTarget "NotepadTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9BFEED000000000000000009 /* Debug */,
+				9BFEED00000000000000000A /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

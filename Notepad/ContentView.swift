@@ -650,13 +650,66 @@ final class DocumentRegistry {
     }
 
     func allStates() -> [DocumentSessionState] {
-        documents.values
-            .sorted { $0.windowIndex < $1.windowIndex }
-            .enumerated()
-            .map { idx, doc in doc.sessionState(index: idx) }
+        let ordered = documents.values.sorted { $0.windowIndex < $1.windowIndex }
+        // Collapse duplicate windows on the same file before persisting. Without
+        // this the session grew by one entry per launch, forever — see
+        // SessionDeduplication.swift. Doing it here also heals sessions that are
+        // already bloated, on the next quit.
+        let kept = indicesKeepingFirstPerURL(ordered.map(\.fileURL))
+        return kept.enumerated().map { position, index in
+            ordered[index].sessionState(index: position)
+        }
     }
 
     func allDocuments() -> [NotepadDocument] { Array(documents.values) }
+
+    // MARK: Window bindings
+    //
+    // Which document lives in which window. Weak on both sides so a closed
+    // window and its document both deallocate normally.
+
+    private let windowBindings = NSMapTable<NSWindow, NotepadDocument>.weakToWeakObjects()
+
+    func bind(window: NSWindow, to doc: NotepadDocument) {
+        windowBindings.setObject(doc, forKey: window)
+    }
+
+    func document(for window: NSWindow) -> NotepadDocument? {
+        windowBindings.object(forKey: window)
+    }
+
+    /// The document the user is actually looking at.
+    ///
+    /// File-menu commands read the document from SwiftUI's
+    /// `@FocusedValue(\.notepadDocument)`, which goes nil whenever nothing in the
+    /// window holds first responder — switching between grid and raw text leaves
+    /// it exactly like that. `document?.saveDocument()` on a nil then did
+    /// NOTHING while File ▸ Save still looked enabled, so a ⌘S silently failed to
+    /// save. This is the fallback that makes the commands work regardless.
+    var activeDocument: NotepadDocument? {
+        if let window = NSApp.keyWindow, let doc = document(for: window) { return doc }
+        if let window = NSApp.mainWindow, let doc = document(for: window) { return doc }
+        return nil
+    }
+
+    /// An already-open document showing `url`, if there is one.
+    ///
+    /// Matches on the DOCUMENT registry rather than the window bindings: a
+    /// restored document sets its fileURL synchronously in `restore(from:)`, but
+    /// its window binding is established later by WindowAccessor. Looking through
+    /// the windows therefore missed a file that had just been restored, and a
+    /// Finder open raced in and created a second window for it.
+    func document(showing url: URL) -> NotepadDocument? {
+        documents.values.first { $0.fileURL == url }
+    }
+
+    /// The window a document lives in, once its binding exists.
+    func window(for doc: NotepadDocument) -> NSWindow? {
+        guard let windows = windowBindings.keyEnumerator().allObjects as? [NSWindow] else {
+            return nil
+        }
+        return windows.first { windowBindings.object(forKey: $0) === doc }
+    }
 }
 
 
@@ -707,7 +760,12 @@ struct ContentView: View {
         .sheet(isPresented: $document.showWordCount) {
             WordCountView(text: document.text)
         }
-        .background(WindowAccessor { myWindow = $0 })
+        .background(WindowAccessor {
+            myWindow = $0
+            // Records which document lives in this window, so File-menu commands
+            // can find it even when SwiftUI's focused value has gone nil.
+            DocumentRegistry.shared.bind(window: $0, to: document)
+        })
         .toolbar {
             // ── Writing Tools ────────────────────────────────────────────────
             ToolbarItem(placement: .automatic) {
@@ -819,6 +877,17 @@ struct ContentView: View {
     }
 
     private func handleFileOpen(url: URL) {
+        // Already open? Bring that window forward instead of making another.
+        // Session restore and a Finder open would otherwise both produce a window
+        // for the same file, and quitting persisted both — so every launch added
+        // one more copy of the file, without bound.
+        if let existing = DocumentRegistry.shared.document(showing: url), existing !== document {
+            // Focusing is best-effort — the window binding may not exist yet — but
+            // NOT opening a duplicate is the part that matters.
+            DocumentRegistry.shared.window(for: existing)?.makeKeyAndOrderFront(nil)
+            NSApp.activate()
+            return
+        }
         if document.text.isEmpty && !document.isModified && document.fileURL == nil {
             document.loadFile(from: url)
         } else {
