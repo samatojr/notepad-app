@@ -224,10 +224,23 @@ struct NotepadApp: App {
             SessionManager.shared.loadAndEnqueue()
             SessionManager.shared.clearClosedTabs()
         }
+        // Sparkle runs only in Release builds of the shipping app.
+        //
+        // A debug build carries the same production SUFeedURL, and the shipped
+        // defaults have SUAutomaticallyUpdate on — so a development build whose
+        // CFBundleVersion is behind the appcast will quietly download the
+        // RELEASED app and install it over the build being tested. Debug builds
+        // must never talk to the production feed.
+        //
+        // Also stopped under test: a background check firing mid-run is noise at
+        // best and a network dependency at worst.
+        #if DEBUG
+        let shouldStartUpdater = false
+        #else
+        let shouldStartUpdater = !TestEnvironment.isRunningUnitTests
+        #endif
         updaterController = SPUStandardUpdaterController(
-            // Leave the updater stopped under test — a background check firing
-            // mid-run is noise at best and a network dependency at worst.
-            startingUpdater: !TestEnvironment.isRunningUnitTests,
+            startingUpdater: shouldStartUpdater,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
@@ -321,12 +334,24 @@ extension FocusedValues {
 
 struct NotepadCommands: Commands {
     @FocusedValue(\.notepadDocument) private var document: NotepadDocument?
+
+    /// The document these commands act on.
+    ///
+    /// SwiftUI's focused value is the primary source, but it goes nil whenever
+    /// nothing in the window holds first responder — which is exactly the state
+    /// left behind by switching between grid and raw text. `document?.save…()`
+    /// on a nil is a silent no-op while the menu item still looks enabled, so
+    /// ⌘S appeared to work and saved nothing. Falling back to the key window's
+    /// document makes every command act on what the user is looking at.
+    private var target: NotepadDocument? {
+        document ?? DocumentRegistry.shared.activeDocument
+    }
     @ObservedObject var recents: RecentFilesManager
     let updater: SPUUpdater
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("New") { document?.newDocument() }
+            Button("New") { target?.newDocument() }
                 .keyboardShortcut("n")
             Button("New Tab") {
                 NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
@@ -337,22 +362,22 @@ struct NotepadCommands: Commands {
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
             Divider()
-            Button("Open…") { document?.openDocument() }
+            Button("Open…") { target?.openDocument() }
                 .keyboardShortcut("o")
             Divider()
             recentFilesMenu
             Divider()
             Menu("Reopen with Encoding") {
                 ForEach(FileEncoding.menuCases, id: \.self) { encoding in
-                    Button(encoding.displayName) { document?.reopen(with: encoding) }
+                    Button(encoding.displayName) { target?.reopen(with: encoding) }
                 }
             }
-            .disabled(document?.fileURL == nil)
+            .disabled(target?.fileURL == nil)
             Menu("Save with Encoding") {
                 ForEach(FileEncoding.menuCases, id: \.self) { encoding in
                     Toggle(isOn: Binding(
-                        get: { document?.fileEncoding == encoding },
-                        set: { if $0 { document?.setEncoding(encoding) } }
+                        get: { target?.fileEncoding == encoding },
+                        set: { if $0 { target?.setEncoding(encoding) } }
                     )) { Text(encoding.displayName) }
                 }
             }
@@ -360,8 +385,8 @@ struct NotepadCommands: Commands {
             Menu("Line Endings") {
                 ForEach(LineEnding.allCases, id: \.self) { ending in
                     Toggle(isOn: Binding(
-                        get: { document?.lineEnding == ending },
-                        set: { if $0 { document?.setLineEnding(ending) } }
+                        get: { target?.lineEnding == ending },
+                        set: { if $0 { target?.setLineEnding(ending) } }
                     )) { Text(ending.displayName) }
                 }
             }
@@ -391,9 +416,9 @@ struct NotepadCommands: Commands {
                 NotificationCenter.default.post(name: .clearSession, object: nil)
             }
             Divider()
-            Button("Save") { document?.saveDocument() }
+            Button("Save") { target?.saveDocument() }
                 .keyboardShortcut("s")
-            Button("Save As…") { document?.saveAsDocument() }
+            Button("Save As…") { target?.saveAsDocument() }
                 .keyboardShortcut("S")
         }
 
@@ -401,7 +426,7 @@ struct NotepadCommands: Commands {
         CommandGroup(replacing: .printItem) {
             Button("Page Setup…") { DocumentPrinter.pageSetup(window: NSApp.keyWindow) }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
-            Button("Print…") { document?.printDocument(window: NSApp.keyWindow) }
+            Button("Print…") { target?.printDocument(window: NSApp.keyWindow) }
                 .keyboardShortcut("p")
                 .disabled(document == nil)
         }
@@ -416,44 +441,44 @@ struct NotepadCommands: Commands {
         // ── Edit menu additions ──────────────────────────────────────────────
         CommandGroup(after: .pasteboard) {
             Divider()
-            Button("Find & Replace…") { document?.showFindReplace = true }
+            Button("Find & Replace…") { target?.showFindReplace = true }
                 .keyboardShortcut("f")
-            Button("Find Next") { document?.findNext() }
+            Button("Find Next") { target?.findNext() }
                 .keyboardShortcut("g")
-            Button("Find Previous") { document?.findPrevious() }
+            Button("Find Previous") { target?.findPrevious() }
                 .keyboardShortcut("G")
             Divider()
-            Button("Go to Line…") { document?.promptGoToLine() }
+            Button("Go to Line…") { target?.promptGoToLine() }
                 .keyboardShortcut("l")
                 .disabled(document == nil)
             Divider()
-            Button("Word Count…") { document?.showWordCount = true }
+            Button("Word Count…") { target?.showWordCount = true }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
             Divider()
-            Button(document?.isPrettyPrinted == true ? "Show Original" : "Pretty Print") {
-                document?.prettyPrintDocument()
+            Button(target?.isPrettyPrinted == true ? "Show Original" : "Pretty Print") {
+                target?.prettyPrintDocument()
             }
             .keyboardShortcut("p", modifiers: [.command, .option])
-            .disabled(!(document?.language.canPrettyPrint ?? false))
+            .disabled(!(target?.language.canPrettyPrint ?? false))
         }
 
         // ── View menu ────────────────────────────────────────────────────────
         CommandGroup(after: .toolbar) {
             Divider()
             Toggle(isOn: Binding(
-                get: { document?.wordWrap ?? true },
-                set: { document?.wordWrap = $0 }
+                get: { target?.wordWrap ?? true },
+                set: { target?.wordWrap = $0 }
             )) { Text("Word Wrap") }
             Toggle(isOn: Binding(
-                get: { document?.showStatusBar ?? true },
-                set: { document?.showStatusBar = $0 }
+                get: { target?.showStatusBar ?? true },
+                set: { target?.showStatusBar = $0 }
             )) { Text("Status Bar") }
             Divider()
-            Button("Zoom In")     { document?.fontSize = min(28, (document?.fontSize ?? 13) + 1) }
+            Button("Zoom In")     { target?.fontSize = min(28, (target?.fontSize ?? 13) + 1) }
                 .keyboardShortcut("=", modifiers: .command)
-            Button("Zoom Out")    { document?.fontSize = max(9,  (document?.fontSize ?? 13) - 1) }
+            Button("Zoom Out")    { target?.fontSize = max(9,  (target?.fontSize ?? 13) - 1) }
                 .keyboardShortcut("-", modifiers: .command)
-            Button("Actual Size") { document?.fontSize = 13 }
+            Button("Actual Size") { target?.fontSize = 13 }
                 .keyboardShortcut("0", modifiers: .command)
             Divider()
             Button("Show All Tabs") {
@@ -462,8 +487,8 @@ struct NotepadCommands: Commands {
             .keyboardShortcut("\\", modifiers: [.command, .shift])
             Divider()
             Menu("View As Grid") {
-                Button("Comma-separated (CSV)") { document?.forceGridView(delimiter: ",") }
-                Button("Tab-separated (TSV)")   { document?.forceGridView(delimiter: "\t") }
+                Button("Comma-separated (CSV)") { target?.forceGridView(delimiter: ",") }
+                Button("Tab-separated (TSV)")   { target?.forceGridView(delimiter: "\t") }
             }
             .disabled(document == nil)
             Divider()
@@ -487,7 +512,7 @@ struct NotepadCommands: Commands {
         } else {
             Menu("Open Recent") {
                 ForEach(recents.recentURLs, id: \.self) { url in
-                    Button(url.lastPathComponent) { document?.loadFile(from: url) }
+                    Button(url.lastPathComponent) { target?.loadFile(from: url) }
                 }
                 Divider()
                 Button("Clear All") { recents.clearAll() }

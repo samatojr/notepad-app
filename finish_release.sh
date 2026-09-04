@@ -16,8 +16,8 @@
 
 set -euo pipefail
 
-VERSION="3.4"
-BUILD="29"
+VERSION="3.4.1"
+BUILD="30"
 REPO="samatojr/notepad-app"
 DIR="/tmp/np-release"
 APP="$DIR/Notepad.app"

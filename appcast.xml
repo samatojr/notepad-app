@@ -6,6 +6,33 @@
         <description>Updates for Notepad</description>
         <language>en</language>
         <item>
+            <title>3.4.1</title>
+            <sparkle:version>30</sparkle:version>
+            <sparkle:shortVersionString>3.4.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[
+                <ul>
+                    <li>Files that aren't UTF-8 — a spreadsheet exported from Excel on Windows, say — now open properly instead of coming up blank. Saving keeps the file's original encoding and line endings.</li>
+                    <li>Saving an empty document over a file that still has content now asks first.</li>
+                    <li>Opening a file that isn't text is refused, rather than filling the window with garbage you could save over the original.</li>
+                    <li>Printing works. ⌘P prints the document, and a CSV prints as a real table with the column headings repeated on every page.</li>
+                    <li>Go to Line (⌘L) jumps to a line number, or to a row when a CSV is showing as a grid.</li>
+                    <li>The grid now uses the same monospaced font as the editor, so figures line up. Columns align themselves: numbers to the right, short entries like Yes/No centred, text to the left.</li>
+                    <li>Zoom (⌘+ and ⌘−) now works in grid view as well as the editor.</li>
+                    <li>Undo works in the grid — cell edits, row deletions and pastes can all be taken back.</li>
+                    <li>Insert Row and Duplicate Row added to the grid's right-click menu.</li>
+                    <li>Replace All now works in grid view instead of quietly throwing the replacements away.</li>
+                </ul>
+            ]]></description>
+            <pubDate>Fri, 04 Sep 2026 10:04:38 +0000</pubDate>
+            <enclosure url="https://github.com/samatojr/notepad-app/releases/download/v3.4.1/Notepad_3.4.1.zip"
+                       sparkle:version="30"
+                       sparkle:shortVersionString="3.4.1"
+                       sparkle:edSignature="hTpIYWr0wJx1kIYbsbz/yW1IpRe7RHQfwK1PcoZfsqev2QVnX6a3sxHwu+haaPfm1aB8bEvqy8uN5MxJBGF2Aw=="
+                       length="4402671"
+                       type="application/octet-stream" />
+        </item>
+        <item>
             <title>3.4</title>
             <sparkle:version>29</sparkle:version>
             <sparkle:shortVersionString>3.4</sparkle:shortVersionString>
