@@ -815,6 +815,21 @@ struct ContentView: View {
         // To remove: delete this modifier and the AppPreferences.isAmatoPadMode property.
         .accentColor(AppPreferences.shared.isAmatoPadMode ? .red : nil)
         .navigationTitle(windowTitle)
+        // Drive the window title explicitly as well.
+        //
+        // Closing the last tab resets the document rather than closing the window,
+        // so the title should go back to "Untitled" — reported from the beta that
+        // the old file name stays. reset() is not the problem: DocumentResetTests
+        // pins down that it clears fileURL and displayName goes back to
+        // "Untitled". What does not follow is the window title, which is left to
+        // SwiftUI's navigationTitle to push into AppKit.
+        //
+        // Leaning on that implicit coupling is the same shape of mistake as
+        // reading the document from @FocusedValue and finding it nil — so set the
+        // title outright rather than hoping it propagates.
+        .onChange(of: windowTitle, initial: true) { _, title in
+            myWindow?.title = title
+        }
         .focusedValue(\.notepadDocument, document)
         .sheet(isPresented: $document.showWordCount) {
             WordCountView(text: document.text)
@@ -824,6 +839,7 @@ struct ContentView: View {
             // Records which document lives in this window, so File-menu commands
             // can find it even when SwiftUI's focused value has gone nil.
             DocumentRegistry.shared.bind(window: $0, to: document)
+            $0.title = windowTitle
         })
         .toolbar {
             // ── Writing Tools ────────────────────────────────────────────────
