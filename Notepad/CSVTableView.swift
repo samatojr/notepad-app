@@ -133,6 +133,10 @@ final class CopyableTableView: NSTableView {
     var renameColumnHandler: ((Int) -> Void)?
     var sortColumnHandler:   ((Int) -> Void)?
 
+    var fillDownHandler:  (() -> Void)?
+    var fillRightHandler: (() -> Void)?
+    var clearSortHandler: (() -> Void)?
+
     var selectionChanged: (() -> Void)?
     var beginEditRequested: ((Int, Int) -> Void)?
 
@@ -315,31 +319,89 @@ final class CopyableTableView: NSTableView {
     // MARK: Keyboard
 
     override func keyDown(with event: NSEvent) {
+        let extending = event.modifierFlags.contains(.shift)
+
         if event.modifierFlags.contains(.command) {
+            // ⌘ + arrow jumps to the edge of the grid, the way a spreadsheet does.
+            switch event.keyCode {
+            case 123: jumpToEdge(rowDelta: 0,  columnDelta: -1, extending: extending); return
+            case 124: jumpToEdge(rowDelta: 0,  columnDelta: 1,  extending: extending); return
+            case 125: jumpToEdge(rowDelta: 1,  columnDelta: 0,  extending: extending); return
+            case 126: jumpToEdge(rowDelta: -1, columnDelta: 0,  extending: extending); return
+            default: break
+            }
             switch event.charactersIgnoringModifiers {
-            case "c": copyHandler?();  return
-            case "x": cutHandler?();   return
-            case "v": pasteHandler?(); return
+            case "c": copyHandler?();      return
+            case "x": cutHandler?();       return
+            case "v": pasteHandler?();     return
+            case "d": fillDownHandler?();  return
+            case "r": fillRightHandler?(); return
             default:  super.keyDown(with: event); return
             }
         }
 
-        let extending = event.modifierFlags.contains(.shift)
         switch event.keyCode {
-        case 123: moveFocus(rowDelta: 0,  columnDelta: -1, extending: extending); return  // ←
-        case 124: moveFocus(rowDelta: 0,  columnDelta: 1,  extending: extending); return  // →
-        case 125: moveFocus(rowDelta: 1,  columnDelta: 0,  extending: extending); return  // ↓
-        case 126: moveFocus(rowDelta: -1, columnDelta: 0,  extending: extending); return  // ↑
-        case 36, 76:                                                                      // Return
+        case 48:                                                                          // Tab
+            // Tab walks cell to cell and wraps at the edges — shift-Tab goes back.
+            moveByCell(forward: !extending)
+            return
+        case 115: moveToRowEdge(trailing: false, extending: extending); return             // Home
+        case 119: moveToRowEdge(trailing: true,  extending: extending); return             // End
+        case 123: moveFocus(rowDelta: 0,  columnDelta: -1, extending: extending); return   // ←
+        case 124: moveFocus(rowDelta: 0,  columnDelta: 1,  extending: extending); return   // →
+        case 125: moveFocus(rowDelta: 1,  columnDelta: 0,  extending: extending); return   // ↓
+        case 126: moveFocus(rowDelta: -1, columnDelta: 0,  extending: extending); return   // ↑
+        case 36, 76:                                                                       // Return
             if let focus { beginEditRequested?(focus.row, focus.column) }
             return
-        case 51, 117:                                                                     // Delete
+        case 51, 117:                                                                      // Delete
             clearHandler?()
             return
         default:
             break
         }
         super.keyDown(with: event)
+    }
+
+    /// Tab / shift-Tab: one cell along, wrapping to the next or previous row.
+    private func moveByCell(forward: Bool) {
+        guard numberOfRows > 0, dataColumnCount > 0 else { return }
+        let base = focus ?? anchor ?? GridCellAddress(row: 0, column: 0)
+        var row = base.row
+        var column = base.column + (forward ? 1 : -1)
+        if column >= dataColumnCount {
+            column = 0
+            row = min(row + 1, numberOfRows - 1)
+        } else if column < 0 {
+            column = dataColumnCount - 1
+            row = max(row - 1, 0)
+        }
+        setSelection(anchor: GridCellAddress(row: row, column: column))
+        scrollRowToVisible(row)
+    }
+
+    /// ⌘ + arrow: straight to the far edge in that direction.
+    private func jumpToEdge(rowDelta: Int, columnDelta: Int, extending: Bool) {
+        guard numberOfRows > 0, dataColumnCount > 0 else { return }
+        let base = focus ?? anchor ?? GridCellAddress(row: 0, column: 0)
+        let target = GridCellAddress(
+            row:    rowDelta == 0    ? base.row    : (rowDelta > 0 ? numberOfRows - 1 : 0),
+            column: columnDelta == 0 ? base.column : (columnDelta > 0 ? dataColumnCount - 1 : 0))
+        if extending { extendSelection(to: target) } else { setSelection(anchor: target) }
+        scrollRowToVisible(target.row)
+    }
+
+    /// Home / End: first or last column of the current row.
+    private func moveToRowEdge(trailing: Bool, extending: Bool) {
+        jumpToEdge(rowDelta: 0, columnDelta: trailing ? 1 : -1, extending: extending)
+    }
+
+    /// ⌘A selects every cell, not every row — the grid's unit is the cell.
+    override func selectAll(_ sender: Any?) {
+        guard numberOfRows > 0, dataColumnCount > 0 else { return }
+        setSelection(anchor: GridCellAddress(row: 0, column: 0),
+                     focus: GridCellAddress(row: numberOfRows - 1,
+                                            column: dataColumnCount - 1))
     }
 
     /// Moves the focus cell, extending the selection when shift is held and
@@ -377,6 +439,23 @@ final class CopyableTableView: NSTableView {
         case #selector(copy(_:)):  return copyHandler  != nil && selectedRange != nil
         case #selector(cut(_:)):   return cutHandler   != nil && selectedRange != nil
         case #selector(paste(_:)): return pasteHandler != nil
+        case #selector(selectAll(_:)):
+            return numberOfRows > 0 && dataColumnCount > 0
+        case #selector(fillDownAction(_:)):
+            // Needs at least two rows selected: with one there is nothing to fill into.
+            return (selectedRange?.rowCount ?? 0) > 1
+        case #selector(fillRightAction(_:)):
+            return (selectedRange?.columnCount ?? 0) > 1
+        case #selector(insertColumnBeforeAction(_:)),
+             #selector(insertColumnAfterAction(_:)),
+             #selector(renameColumnAction(_:)):
+            return selectedRange != nil
+        case #selector(deleteColumnsAction(_:)):
+            return !fullySelectedColumns.isEmpty
+        case #selector(duplicateRowsAction(_:)), #selector(deleteRowsAction(_:)):
+            return !selectedRowIndexes.isEmpty
+        case #selector(insertRowAction(_:)):
+            return true
         default: return super.validateUserInterfaceItem(item)
         }
     }
@@ -463,6 +542,42 @@ final class CopyableTableView: NSTableView {
         menu.addItem(item)
     }
 
+    // MARK: Menu-bar actions
+    //
+    // The Table menu sends these up the responder chain with
+    // NSApp.sendAction(_:to:nil:), so they fire only while a grid actually has
+    // focus — a text document simply never answers them. They act on the
+    // SELECTION, unlike the context-menu versions below, which act on whatever
+    // column was right-clicked.
+
+    /// Column the menu-bar column operations act on: the left edge of the selection.
+    private var selectionColumn: Int? { selectedRange?.leftColumn }
+
+    @objc func fillDownAction(_ sender: Any?)  { fillDownHandler?() }
+    @objc func fillRightAction(_ sender: Any?) { fillRightHandler?() }
+    @objc func clearSortAction(_ sender: Any?) { clearSortHandler?() }
+
+    @objc func insertColumnBeforeAction(_ sender: Any?) {
+        guard let column = selectionColumn else { return }
+        insertColumnHandler?(column)
+    }
+
+    @objc func insertColumnAfterAction(_ sender: Any?) {
+        guard let range = selectedRange else { return }
+        insertColumnHandler?(range.rightColumn + 1)
+    }
+
+    @objc func deleteColumnsAction(_ sender: Any?) { deleteColumnHandler?() }
+
+    @objc func renameColumnAction(_ sender: Any?) {
+        guard let column = selectionColumn else { return }
+        renameColumnHandler?(column)
+    }
+
+    @objc func insertRowAction(_ sender: Any?)     { insertHandler?() }
+    @objc func duplicateRowsAction(_ sender: Any?) { duplicateHandler?() }
+    @objc func deleteRowsAction(_ sender: Any?)    { deleteHandler?() }
+
     @objc private func deleteRows(_ sender: Any?)    { deleteHandler?() }
     @objc private func insertRow(_ sender: Any?)     { insertHandler?() }
     @objc private func duplicateRows(_ sender: Any?) { duplicateHandler?() }
@@ -521,6 +636,10 @@ struct CSVTableView: NSViewRepresentable {
         dataTable.deleteColumnHandler = { [weak coord] in coord?.deleteSelectedColumns() }
         dataTable.renameColumnHandler = { [weak coord] column in coord?.renameColumn(column) }
         dataTable.sortColumnHandler   = { [weak coord] column in coord?.toggleSort(column: column) }
+
+        dataTable.fillDownHandler  = { [weak coord] in coord?.fillDown() }
+        dataTable.fillRightHandler = { [weak coord] in coord?.fillRight() }
+        dataTable.clearSortHandler = { [weak coord] in coord?.clearSort() }
 
         dataTable.selectionChanged    = { [weak coord] in coord?.selectionDidChange() }
         dataTable.beginEditRequested  = { [weak coord] row, column in
@@ -1082,6 +1201,36 @@ struct CSVTableView: NSViewRepresentable {
             dt.setSelection(anchor: GridCellAddress(row: anchorRow, column: anchorColumn),
                             focus: GridCellAddress(row: anchorRow + height - 1,
                                                    column: anchorColumn + width - 1))
+        }
+
+        // MARK: Fill
+
+        func fillDown() {
+            guard let dt = tableView, let doc = document,
+                  let range = dt.selectedRange, range.rowCount > 1 else { return }
+            let order = displayOrder
+            doc.mutateCSV(actionName: "Fill Down") { rows in
+                Notepad.fillDown(in: &rows, range: range, displayOrder: order)
+            }
+            dt.reloadData()
+        }
+
+        func fillRight() {
+            guard let dt = tableView, let doc = document,
+                  let range = dt.selectedRange, range.columnCount > 1 else { return }
+            let order = displayOrder
+            doc.mutateCSV(actionName: "Fill Right") { rows in
+                Notepad.fillRight(in: &rows, range: range, displayOrder: order)
+            }
+            dt.reloadData()
+        }
+
+        func clearSort() {
+            guard let dt = tableView, let doc = document, !doc.csvSortKeys.isEmpty else { return }
+            doc.csvSortKeys = []
+            rebuildDisplayOrder(in: doc)
+            applySortIndicators()
+            dt.reloadData()
         }
 
         // MARK: Column operations

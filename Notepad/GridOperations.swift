@@ -147,6 +147,52 @@ nonisolated func clearCells(in rows: inout [CSVRow],
     }
 }
 
+// MARK: - Fill
+
+/// Copies the range's TOP row down over every other row in the range.
+///
+/// The classic spreadsheet ⌘D. Only the columns inside the range are touched, so
+/// filling a two-column selection leaves everything either side of it alone.
+nonisolated func fillDown(in rows: inout [CSVRow],
+                          range: GridRange,
+                          displayOrder: [Int]) {
+    guard range.rowCount > 1, !range.isEmpty else { return }
+    guard displayOrder.indices.contains(range.topRow) else { return }
+    let sourceIndex = displayOrder[range.topRow]
+    guard rows.indices.contains(sourceIndex) else { return }
+    let source = rows[sourceIndex].cells
+
+    for displayRow in (range.topRow + 1)...range.bottomRow {
+        guard displayOrder.indices.contains(displayRow) else { continue }
+        let target = displayOrder[displayRow]
+        guard rows.indices.contains(target) else { continue }
+        for column in range.leftColumn...range.rightColumn {
+            let value = column < source.count ? source[column] : ""
+            padRow(&rows[target], toReach: column)
+            rows[target].cells[column] = value
+        }
+    }
+}
+
+/// Copies the range's LEFT column across every other column in the range — ⌘R.
+nonisolated func fillRight(in rows: inout [CSVRow],
+                           range: GridRange,
+                           displayOrder: [Int]) {
+    guard range.columnCount > 1, !range.isEmpty else { return }
+
+    for displayRow in range.topRow...range.bottomRow {
+        guard displayOrder.indices.contains(displayRow) else { continue }
+        let index = displayOrder[displayRow]
+        guard rows.indices.contains(index) else { continue }
+        let source = range.leftColumn < rows[index].cells.count
+            ? rows[index].cells[range.leftColumn] : ""
+        for column in (range.leftColumn + 1)...range.rightColumn {
+            padRow(&rows[index], toReach: column)
+            rows[index].cells[column] = source
+        }
+    }
+}
+
 // MARK: - Structural column operations
 //
 // These take the WHOLE rows array, header included: a column index addresses

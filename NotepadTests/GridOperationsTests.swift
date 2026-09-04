@@ -516,3 +516,95 @@ struct NumericValueTests {
         #expect(numericValue(value) == nil)
     }
 }
+
+// MARK: - Fill down / fill right
+
+@MainActor
+struct FillTests {
+
+    private func makeRows(_ grid: [[String]]) -> [CSVRow] { grid.map { CSVRow(cells: $0) } }
+    private func cells(_ rows: [CSVRow]) -> [[String]] { rows.map(\.cells) }
+
+    /// header + three data rows; displayOrder skips the header.
+    private var fixture: [CSVRow] {
+        makeRows([["h1", "h2", "h3"],
+                  ["a1", "b1", "c1"],
+                  ["a2", "b2", "c2"],
+                  ["a3", "b3", "c3"]])
+    }
+    private let order = [1, 2, 3]
+
+    @Test("Fill down copies the top row over the rest of the range")
+    func fillsDown() {
+        var rows = fixture
+        fillDown(in: &rows,
+                 range: GridRange(topRow: 0, bottomRow: 2, leftColumn: 0, rightColumn: 1),
+                 displayOrder: order)
+        #expect(cells(rows)[1] == ["a1", "b1", "c1"])   // source untouched
+        #expect(cells(rows)[2] == ["a1", "b1", "c2"])   // c stays: outside the range
+        #expect(cells(rows)[3] == ["a1", "b1", "c3"])
+    }
+
+    @Test("Fill down leaves the header alone")
+    func fillDownSpareHeader() {
+        var rows = fixture
+        fillDown(in: &rows,
+                 range: GridRange(topRow: 0, bottomRow: 2, leftColumn: 0, rightColumn: 2),
+                 displayOrder: order)
+        #expect(cells(rows)[0] == ["h1", "h2", "h3"])
+    }
+
+    @Test("Fill down follows the sort, not the file order")
+    func fillDownThroughSort() {
+        var rows = fixture
+        let sorted = [3, 1, 2]        // a3 displayed first
+        fillDown(in: &rows,
+                 range: GridRange(topRow: 0, bottomRow: 2, leftColumn: 0, rightColumn: 0),
+                 displayOrder: sorted)
+        #expect(cells(rows)[3][0] == "a3")   // source, displayed first
+        #expect(cells(rows)[1][0] == "a3")
+        #expect(cells(rows)[2][0] == "a3")
+    }
+
+    @Test("Fill right copies the left column across the range")
+    func fillsRight() {
+        var rows = fixture
+        fillRight(in: &rows,
+                  range: GridRange(topRow: 0, bottomRow: 1, leftColumn: 0, rightColumn: 2),
+                  displayOrder: order)
+        #expect(cells(rows)[1] == ["a1", "a1", "a1"])
+        #expect(cells(rows)[2] == ["a2", "a2", "a2"])
+        #expect(cells(rows)[3] == ["a3", "b3", "c3"])   // outside the range
+    }
+
+    @Test("A single row or column is a no-op — nothing to fill into")
+    func singleLineIsNoOp() {
+        var rows = fixture
+        let before = cells(rows)
+        fillDown(in: &rows,
+                 range: GridRange(topRow: 1, bottomRow: 1, leftColumn: 0, rightColumn: 2),
+                 displayOrder: order)
+        fillRight(in: &rows,
+                  range: GridRange(topRow: 0, bottomRow: 2, leftColumn: 1, rightColumn: 1),
+                  displayOrder: order)
+        #expect(cells(rows) == before)
+    }
+
+    @Test("Filling into short rows pads them rather than dropping the value")
+    func padsRaggedRows() {
+        var rows = makeRows([["h1", "h2"], ["a1", "b1"], ["a2"]])
+        fillDown(in: &rows,
+                 range: GridRange(topRow: 0, bottomRow: 1, leftColumn: 0, rightColumn: 1),
+                 displayOrder: [1, 2])
+        #expect(cells(rows)[2] == ["a1", "b1"])
+    }
+
+    @Test("Fill down then fill right leaves the whole block equal to its corner")
+    func fillDownThenRight() {
+        var rows = fixture
+        let range = GridRange(topRow: 0, bottomRow: 2, leftColumn: 0, rightColumn: 2)
+        fillDown(in: &rows, range: range, displayOrder: order)
+        fillRight(in: &rows, range: range, displayOrder: order)
+        for index in 1...3 { #expect(cells(rows)[index] == ["a1", "a1", "a1"]) }
+    }
+}
