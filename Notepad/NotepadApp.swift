@@ -3,6 +3,7 @@ import AppKit
 import Combine
 import Sparkle
 
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {

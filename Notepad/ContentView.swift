@@ -69,33 +69,42 @@ final class NotepadDocument {
     var findCaseSensitive: Bool = false
     var findHighlightRange: NSRange? = nil
 
-    let sessionID: UUID
+    private(set) var sessionID: UUID
     var bookmarkData: Data?
     var windowIndex: Int = 0
 
     var displayName: String { fileURL?.lastPathComponent ?? "Untitled" }
 
     init() {
-        // Resolve everything the initializer needs BEFORE touching self, so the
-        // shared load/restore helpers below can be plain methods rather than
-        // three near-identical copies of the same twenty lines.
-        let pendingURL = PendingURLManager.shared.pendingURL
-        // Only a session entry, never the closed-tabs buffer.
-        //
-        // This used to read `popClosed() ?? popPending()`, so EVERY new document
-        // resurrected the most recently closed tab — including one made by ⌘T.
-        // Press New Tab after closing something and a file you did not ask for
-        // appeared in it. Nothing exposes "Reopen Closed Tab" to the user, so
-        // that buffer had no purpose other than producing this.
-        let restoreState: DocumentSessionState? = pendingURL == nil
-            ? SessionManager.shared.popPending()
-            : nil
-        sessionID = restoreState?.sessionID ?? UUID()
+        sessionID = UUID()
+    }
 
-        if let url = pendingURL {
+    /// Whether this document has already taken on its starting content.
+    private var hasClaimedInitialContent = false
+
+    /// Takes on this window's starting content: a file waiting to be opened, or
+    /// the next entry from the restored session.
+    ///
+    /// Deliberately NOT done in `init()`. SwiftUI evaluates a window's `@State`
+    /// initializer many times over — measured at eight on a bare launch — and
+    /// keeps only one of the documents it builds. While the claiming lived in the
+    /// initializer, every one of those throwaway documents popped an entry off the
+    /// session queue and took it to the grave, so restored tabs could come back
+    /// blank and how many you got back depended on how many times SwiftUI happened
+    /// to re-evaluate. An initializer with side effects on shared state cannot be
+    /// correct when the framework is free to call it as often as it likes.
+    ///
+    /// Called from onAppear, which only ever reaches the instance SwiftUI kept,
+    /// and guarded because onAppear can fire more than once for one view.
+    func claimInitialContent() {
+        guard !hasClaimedInitialContent else { return }
+        hasClaimedInitialContent = true
+
+        if let url = PendingURLManager.shared.pendingURL {
             PendingURLManager.shared.pendingURL = nil
             adoptFile(at: url)
-        } else if let state = restoreState {
+        } else if let state = SessionManager.shared.popPending() {
+            sessionID = state.sessionID
             restore(from: state)
         }
         language = Language.detect(from: fileURL)
@@ -884,6 +893,10 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            // Claim before registering: the registry is how a file open discovers
+            // that a document already holds its file, so fileURL has to be set
+            // before anything can look it up.
+            document.claimInitialContent()
             DocumentRegistry.shared.register(document)
             document.requestOpenFile = { url in
                 handleFileOpen(url: url)
