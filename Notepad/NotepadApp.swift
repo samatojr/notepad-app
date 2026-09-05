@@ -3,6 +3,7 @@ import AppKit
 import Combine
 import Sparkle
 
+
 // MARK: - App Delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -346,6 +347,12 @@ struct NotepadCommands: Commands {
     private var target: NotepadDocument? {
         document ?? DocumentRegistry.shared.activeDocument
     }
+
+    /// Sends a Table-menu action up the responder chain to whichever grid has
+    /// focus. Nothing happens in a text document, which is the point.
+    private func sendToGrid(_ action: Selector) {
+        NSApp.sendAction(action, to: nil, from: nil)
+    }
     @ObservedObject var recents: RecentFilesManager
     let updater: SPUUpdater
 
@@ -463,6 +470,49 @@ struct NotepadCommands: Commands {
         }
 
         // ── View menu ────────────────────────────────────────────────────────
+        // MARK: Table menu
+        //
+        // The grid operations existed only in context menus, which meant a user who
+        // did not think to right-click never found them at all. Every item here is
+        // dispatched up the responder chain with NSApp.sendAction(_:to:from:), so
+        // it reaches the grid that has focus and nothing else — a plain text
+        // document simply never answers, and the item validates as disabled.
+        CommandMenu("Table") {
+            Button("Fill Down")  { sendToGrid(#selector(CopyableTableView.fillDownAction(_:))) }
+                .keyboardShortcut("d")
+            Button("Fill Right") { sendToGrid(#selector(CopyableTableView.fillRightAction(_:))) }
+                .keyboardShortcut("r")
+
+            Divider()
+
+            Button("Insert Column Before") {
+                sendToGrid(#selector(CopyableTableView.insertColumnBeforeAction(_:)))
+            }
+            Button("Insert Column After") {
+                sendToGrid(#selector(CopyableTableView.insertColumnAfterAction(_:)))
+            }
+            Button("Delete Columns") {
+                sendToGrid(#selector(CopyableTableView.deleteColumnsAction(_:)))
+            }
+            Button("Rename Column…") {
+                sendToGrid(#selector(CopyableTableView.renameColumnAction(_:)))
+            }
+
+            Divider()
+
+            Button("Insert Row") { sendToGrid(#selector(CopyableTableView.insertRowAction(_:))) }
+            Button("Duplicate Rows") {
+                sendToGrid(#selector(CopyableTableView.duplicateRowsAction(_:)))
+            }
+            Button("Delete Rows") {
+                sendToGrid(#selector(CopyableTableView.deleteRowsAction(_:)))
+            }
+
+            Divider()
+
+            Button("Clear Sort") { sendToGrid(#selector(CopyableTableView.clearSortAction(_:))) }
+        }
+
         CommandGroup(after: .toolbar) {
             Divider()
             Toggle(isOn: Binding(

@@ -38,6 +38,13 @@ final class NotepadDocument {
     var csvShowHeaders:   Bool       = true  // show column header row in table view (on by default)
     var csvSortKeys: [CSVSortKey] = []   // ordered: first = primary sort
     var csvSelectedRowCount: Int = 0     // published by the grid for the status bar
+    /// WHICH cells the grid has selected, as csvRows indices and a column range.
+    /// Deliberately raw coordinates rather than a computed summary: the status
+    /// bar derives the arithmetic from these against the live cell values, so it
+    /// stays correct after an undo without anything writing derived state back
+    /// into the document.
+    var csvSelectionRows: [Int] = []
+    var csvSelectionColumns: ClosedRange<Int>? = nil
     /// Bumped whenever a grid mutation changes the table's shape (row count,
     /// column count, header text) so the table rebuilds its columns instead of
     /// merely reloading — a plain reload would keep stale titles and widths.
@@ -62,26 +69,42 @@ final class NotepadDocument {
     var findCaseSensitive: Bool = false
     var findHighlightRange: NSRange? = nil
 
-    let sessionID: UUID
+    private(set) var sessionID: UUID
     var bookmarkData: Data?
     var windowIndex: Int = 0
 
     var displayName: String { fileURL?.lastPathComponent ?? "Untitled" }
 
     init() {
-        // Resolve everything the initializer needs BEFORE touching self, so the
-        // shared load/restore helpers below can be plain methods rather than
-        // three near-identical copies of the same twenty lines.
-        let pendingURL = PendingURLManager.shared.pendingURL
-        let restoreState: DocumentSessionState? = pendingURL == nil
-            ? (SessionManager.shared.popClosed() ?? SessionManager.shared.popPending())
-            : nil
-        sessionID = restoreState?.sessionID ?? UUID()
+        sessionID = UUID()
+    }
 
-        if let url = pendingURL {
+    /// Whether this document has already taken on its starting content.
+    private var hasClaimedInitialContent = false
+
+    /// Takes on this window's starting content: a file waiting to be opened, or
+    /// the next entry from the restored session.
+    ///
+    /// Deliberately NOT done in `init()`. SwiftUI evaluates a window's `@State`
+    /// initializer many times over — measured at eight on a bare launch — and
+    /// keeps only one of the documents it builds. While the claiming lived in the
+    /// initializer, every one of those throwaway documents popped an entry off the
+    /// session queue and took it to the grave, so restored tabs could come back
+    /// blank and how many you got back depended on how many times SwiftUI happened
+    /// to re-evaluate. An initializer with side effects on shared state cannot be
+    /// correct when the framework is free to call it as often as it likes.
+    ///
+    /// Called from onAppear, which only ever reaches the instance SwiftUI kept,
+    /// and guarded because onAppear can fire more than once for one view.
+    func claimInitialContent() {
+        guard !hasClaimedInitialContent else { return }
+        hasClaimedInitialContent = true
+
+        if let url = PendingURLManager.shared.pendingURL {
             PendingURLManager.shared.pendingURL = nil
             adoptFile(at: url)
-        } else if let state = restoreState {
+        } else if let state = SessionManager.shared.popPending() {
+            sessionID = state.sessionID
             restore(from: state)
         }
         language = Language.detect(from: fileURL)
@@ -205,7 +228,7 @@ final class NotepadDocument {
         // Table view state is per-document too — leaving it set meant the next CSV
         // opened in this tab inherited the previous file's sorting and toggles.
         csvSortKeys = []; csvShowRowNumbers = false; csvShowHeaders = true
-        csvSelectedRowCount = 0
+        csvSelectedRowCount = 0; csvSelectionRows = []; csvSelectionColumns = nil
         fileEncoding = .utf8; lineEnding = .lf
     }
 
@@ -663,6 +686,58 @@ final class DocumentRegistry {
 
     func allDocuments() -> [NotepadDocument] { Array(documents.values) }
 
+    /// Experiment: can a SwiftUI WindowGroup window actually be closed by us?
+    /// Clears away the windows an open leaves behind.
+    ///
+    /// Opening a file spawns an extra window whether the app wants one or not:
+    /// SwiftUI's WindowGroup answers the system's open-document event by creating
+    /// one, and does so BEFORE application(_:open:) is called — traced, two
+    /// document initializers run ahead of the delegate. The app then fills a
+    /// different window with the file and that one is left blank. Repeat per open
+    /// and blank windows pile up, which is the reported symptom.
+    ///
+    /// Not preventable from here: SwiftUI never consults
+    /// applicationShouldOpenUntitledFile, and .handlesExternalEvents(matching: [])
+    /// does not suppress it either — both were tried and traced. So this tidies up
+    /// after the framework instead.
+    ///
+    /// Deliberately conservative. A window is only closed when it is VISIBLE, is
+    /// not the one that just took the file, and is either completely untouched
+    /// (no file, no text, no edits) or an unmodified second view of a file already
+    /// on screen. Anything typed, edited or unsaved is therefore untouchable, and
+    /// the last remaining window is always kept.
+    func closeBlankWindows(keeping keeper: NotepadDocument?) {
+        // Only windows the user can actually see. The registry also holds windows
+        // that were created but never displayed, and counting those made a VISIBLE
+        // window look like the duplicate of an invisible one — which closed the
+        // window the user was looking at.
+        guard let bound = windowBindings.keyEnumerator().allObjects as? [NSWindow] else { return }
+        let windows = bound.filter { $0.isVisible }
+        var remaining = windows.count
+        // A file already shown elsewhere makes a second window for it redundant.
+        // The keeper is recorded first so it is never the one discarded.
+        var seenURLs = Set<URL>()
+        if let url = keeper?.fileURL { seenURLs.insert(url) }
+
+        for window in windows {
+            guard remaining > 1, let doc = windowBindings.object(forKey: window), doc !== keeper
+            else { continue }
+
+            let isBlank = doc.fileURL == nil && doc.text.isEmpty && !doc.isModified
+            var isRedundantDuplicate = false
+            if let url = doc.fileURL, !doc.isModified {
+                // Unmodified only: a second window on the same file with edits in
+                // it is someone's work, not litter.
+                isRedundantDuplicate = !seenURLs.insert(url).inserted
+            } else if let url = doc.fileURL {
+                seenURLs.insert(url)
+            }
+            guard isBlank || isRedundantDuplicate else { continue }
+            window.close()
+            remaining -= 1
+        }
+    }
+
     // MARK: Window bindings
     //
     // Which document lives in which window. Weak on both sides so a closed
@@ -818,6 +893,10 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            // Claim before registering: the registry is how a file open discovers
+            // that a document already holds its file, so fileURL has to be set
+            // before anything can look it up.
+            document.claimInitialContent()
             DocumentRegistry.shared.register(document)
             document.requestOpenFile = { url in
                 handleFileOpen(url: url)
@@ -826,11 +905,11 @@ struct ContentView: View {
         .onDisappear {
             if !AppState.shared.isTerminating {
                 // Only save to closed-tabs buffer if the tab wasn't explicitly dismissed by the user
-                if !AppState.shared.isClearingSession
-                    && !document.isBeingExplicitlyClosed
-                    && (!document.text.isEmpty || document.fileURL != nil) {
-                    SessionManager.shared.pushClosed(document.sessionState(index: 0))
-                }
+                // Nothing consumes the closed-tabs buffer any more (see init),
+                // so filling it would just be writing to defaults for no reader.
+                // If "Reopen Closed Tab" is ever built, this is where it starts —
+                // but it needs an explicit command behind it, not a buffer that
+                // the next document created silently helps itself to.
                 DocumentRegistry.shared.unregister(document)
             }
         }
@@ -886,6 +965,10 @@ struct ContentView: View {
             // NOT opening a duplicate is the part that matters.
             DocumentRegistry.shared.window(for: existing)?.makeKeyAndOrderFront(nil)
             NSApp.activate()
+            // The window spawned for this open has nothing to show now that the
+            // file is already on screen — sweep it too, or repeated opens of the
+            // same file pile blanks up one at a time.
+            sweepBlankWindows(keeping: existing)
             return
         }
         if document.text.isEmpty && !document.isModified && document.fileURL == nil {
@@ -893,6 +976,18 @@ struct ContentView: View {
         } else {
             PendingURLManager.shared.pendingURL = url
             openNewTab()
+        }
+        sweepBlankWindows(keeping: document)
+    }
+
+    /// Clears away the window SwiftUI spawns for an open that the app then fills
+    /// itself. Twice, because SwiftUI is not finished making windows when the
+    /// first pass runs; both passes are idempotent.
+    private func sweepBlankWindows(keeping keeper: NotepadDocument?) {
+        for delay in [0.5, 1.5] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                DocumentRegistry.shared.closeBlankWindows(keeping: keeper)
+            }
         }
     }
 
@@ -1170,6 +1265,58 @@ struct StatusBarView: View {
 
     private var inTableView: Bool { document.csvIsTableView && !document.csvRows.isEmpty }
 
+    /// Arithmetic over the current selection, computed from the LIVE cell values
+    /// each time the status bar renders. Deriving it here rather than caching it
+    /// on the document means an undo that restores different values into the same
+    /// cells shows the right total immediately.
+    private var selectionSummary: SelectionSummary? {
+        guard let columns = document.csvSelectionColumns,
+              !document.csvSelectionRows.isEmpty else { return nil }
+        let rows = document.csvRows
+        // A whole-column selection in a very large file would make this run over
+        // every row on each render. Past this point report the size only.
+        let cellCount = document.csvSelectionRows.count * columns.count
+        guard cellCount <= Self.maxSummarizedCells else {
+            var partial = SelectionSummary()
+            partial.cellCount = cellCount
+            return partial
+        }
+        var cells: [[String]] = []
+        cells.reserveCapacity(document.csvSelectionRows.count)
+        for index in document.csvSelectionRows where rows.indices.contains(index) {
+            let source = rows[index].cells
+            cells.append(columns.map { $0 < source.count ? source[$0] : "" })
+        }
+        return summarize(cells)
+    }
+
+    private static let maxSummarizedCells = 200_000
+
+    /// "Selected: 12 cells" — or just the count for a single cell.
+    private func selectionLabel(_ summary: SelectionSummary) -> String {
+        summary.cellCount == 1 ? "Selected: 1 cell"
+                               : "Selected: \(summary.cellCount) cells"
+    }
+
+    /// Sum and average of the numeric part of the selection, the way a
+    /// spreadsheet's status bar reports it.
+    private func arithmeticLabel(_ summary: SelectionSummary) -> String {
+        var parts = ["Sum: \(formatted(summary.sum))"]
+        if let average = summary.average, summary.numericCount > 1 {
+            parts.append("Avg: \(formatted(average))")
+        }
+        return parts.joined(separator: "   ")
+    }
+
+    /// Trims the trailing ".0" off whole numbers so a column of integers reads
+    /// as integers, while keeping real decimals readable.
+    private func formatted(_ value: Double) -> String {
+        if value == value.rounded(), abs(value) < 1e15 {
+            return String(format: "%.0f", value)
+        }
+        return String(format: "%g", value)
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             if inTableView {
@@ -1177,9 +1324,13 @@ struct StatusBarView: View {
                 pill("Rows: \(max(0, document.csvRows.count - 1))")
                 Divider().frame(height: 12)
                 pill("Columns: \(document.csvRows.first?.cells.count ?? 0)")
-                if document.csvSelectedRowCount > 0 {
+                if let summary = selectionSummary, summary.cellCount > 0 {
                     Divider().frame(height: 12)
-                    pill("Selected: \(document.csvSelectedRowCount)")
+                    pill(selectionLabel(summary))
+                    if summary.hasNumbers {
+                        Divider().frame(height: 12)
+                        pill(arithmeticLabel(summary))
+                    }
                 }
                 if !document.csvSortKeys.isEmpty {
                     Divider().frame(height: 12)
