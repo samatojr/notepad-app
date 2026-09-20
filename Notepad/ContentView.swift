@@ -840,6 +840,9 @@ struct ContentView: View {
             // Records which document lives in this window, so File-menu commands
             // can find it even when SwiftUI's focused value has gone nil.
             DocumentRegistry.shared.bind(window: $0, to: document)
+            // Binding first: the prompt looks the document up by window, so the
+            // registry has to know about it before the delegate can ask.
+            installClosePrompt(on: $0)
         })
         .toolbar {
             // ── Writing Tools ────────────────────────────────────────────────
@@ -902,14 +905,17 @@ struct ContentView: View {
                 handleFileOpen(url: url)
             }
         }
+        // Still unregisters here, but this is no longer where a closing document
+        // is dealt with. .onDisappear reports a view leaving the hierarchy: it
+        // arrives with no opportunity to keep anything, which is how a closed tab
+        // used to take its unsaved text with it. AppDelegate watches
+        // NSWindow.willCloseNotification and calls noteWindowWillClose, which
+        // snapshots the work first. This remains as the backstop for a window
+        // that closes before WindowAccessor has managed to bind it — that window
+        // has no entry to look the document up by, and leaving it in the registry
+        // would restore a phantom tab on the next launch.
         .onDisappear {
             if !AppState.shared.isTerminating {
-                // Only save to closed-tabs buffer if the tab wasn't explicitly dismissed by the user
-                // Nothing consumes the closed-tabs buffer any more (see init),
-                // so filling it would just be writing to defaults for no reader.
-                // If "Reopen Closed Tab" is ever built, this is where it starts —
-                // but it needs an explicit command behind it, not a buffer that
-                // the next document created silently helps itself to.
                 DocumentRegistry.shared.unregister(document)
             }
         }
@@ -927,6 +933,16 @@ struct ContentView: View {
             } else {
                 guard NSApp.keyWindow == myWindow else { return }
             }
+            openNewTab()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .reopenClosedTab)) { note in
+            // Token-claimed like the others, so exactly one window answers.
+            guard let token = note.userInfo?["token"] as? UUID,
+                  SessionTabClaims.shared.claim(token) else { return }
+            // Popped HERE rather than in the menu command: if no window is around
+            // to answer, the buffer must stay intact rather than quietly draining.
+            guard let state = SessionManager.shared.popClosed() else { return }
+            SessionManager.shared.enqueueForRestore(state)
             openNewTab()
         }
         .onReceive(NotificationCenter.default.publisher(for: .clearSession)) { _ in
@@ -1031,9 +1047,15 @@ struct ContentView: View {
         let tabCount = myWindow?.tabbedWindows?.count ?? 1
         if tabCount <= 1 {
             // Last (or only) tab — reset to a fresh blank rather than closing the window.
-            // Resetting means nothing gets pushed to the closed-tabs buffer; the now-blank
-            // document is effectively a clean new tab from the user's perspective.
+            // No window closes, so nothing else records this document: the snapshot
+            // has to happen here or reset() simply erases the text.
+            if holdsUnsavedWork(fileURL: document.fileURL,
+                                isModified: document.isModified,
+                                text: document.text) {
+                SessionManager.shared.pushClosed(document.sessionState(index: 0))
+            }
             document.reset()
+            SessionManager.shared.persistOpenDocuments()
         } else {
             // Multiple tabs open — close this one; the rest stay visible.
             document.isBeingExplicitlyClosed = true
