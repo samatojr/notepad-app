@@ -796,7 +796,12 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
 
     private var windowTitle: String {
-        document.isModified ? "\(document.displayName) — Edited" : document.displayName
+        // "Edited" only means something when there is a saved file to be edited
+        // away from. An untitled scratch tab is never in a state worth flagging:
+        // it has no on-disk copy to differ from, and the session keeps it either
+        // way, so the marker was permanent and meaningless.
+        guard document.fileURL != nil, document.isModified else { return document.displayName }
+        return "\(document.displayName) — Edited"
     }
 
     var body: some View {

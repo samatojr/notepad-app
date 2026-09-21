@@ -425,9 +425,14 @@ struct NotepadCommands: Commands {
                 // Prompt to save each modified document. Same shared prompt the
                 // quit and window-close paths use — see SaveOnClose.swift.
                 for doc in DocumentRegistry.shared.allDocuments() {
+                    // .permanent: this is the one action that wipes the session
+                    // AND the recovery buffer, so even scratch text — which
+                    // closing and quitting no longer ask about — is genuinely
+                    // about to be destroyed and has to be offered first.
                     guard resolveUnsavedWork(
                         in: doc,
-                        consequence: "Your unsaved changes will be lost if you clear the session."
+                        consequence: "Your unsaved changes will be lost if you clear the session.",
+                        discard: .permanent
                     ) else { return }   // user cancelled
                 }
                 AppState.shared.isClearingSession = true

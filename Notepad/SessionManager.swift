@@ -188,13 +188,10 @@ final class PendingURLManager {
     /// (they often differ, and a window may never capture its own reference), so
     /// each broadcast carries a token and the first view to claim it handles the
     /// file. Guarantees exactly one open, and that it is never silently dropped.
-    private var claimedTokens: Set<UUID> = []
+    private var tokens = OneShotTokens()
 
     func claim(_ token: UUID) -> Bool {
-        guard !claimedTokens.contains(token) else { return false }
-        claimedTokens.insert(token)
-        if claimedTokens.count > 64 { claimedTokens.removeAll() }
-        return true
+        tokens.claim(token)
     }
 }
 
@@ -209,13 +206,10 @@ final class SessionTabClaims {
     static let shared = SessionTabClaims()
     private init() {}
 
-    private var claimedTokens: Set<UUID> = []
+    private var tokens = OneShotTokens()
 
     func claim(_ token: UUID) -> Bool {
-        guard !claimedTokens.contains(token) else { return false }
-        claimedTokens.insert(token)
-        if claimedTokens.count > 64 { claimedTokens.removeAll() }
-        return true
+        tokens.claim(token)
     }
 }
 
