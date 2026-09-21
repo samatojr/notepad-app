@@ -38,6 +38,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
+        // A window closing is the moment a document's unsaved text is either
+        // kept or lost for good, and nothing in the app was watching for it.
+        // See SaveOnClose.swift.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(documentWindowWillClose(_:)),
+            name: NSWindow.willCloseNotification,
+            object: nil
+        )
+
         // EASTER EGG: re-apply all appearance changes on launch if mode was persisted
         if AppPreferences.shared.isAmatoPadMode {
             updateDockIcon()
@@ -46,6 +56,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.applyAmatoPadAppearance()
             }
         }
+    }
+
+    /// Fires for every window in the app. Only document windows are in the
+    /// registry, so panels, sheets and alerts fall straight through.
+    @objc private func documentWindowWillClose(_ note: Notification) {
+        guard let window = note.object as? NSWindow,
+              let document = DocumentRegistry.shared.document(for: window) else { return }
+        noteWindowWillClose(document)
     }
 
     // EASTER EGG: called when the user triggers AmatoPad mode via the find bar.
@@ -135,22 +153,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Prompt for every document with unsaved changes. Without this, quitting
         // silently discarded edits to any file-backed document: sessionState only
         // caches text for untitled docs, so restore re-read the stale copy on disk.
-        // An untitled, empty document has nothing worth saving — don't nag about it.
-        for doc in DocumentRegistry.shared.allDocuments().filter({
-            $0.isModified && !($0.fileURL == nil && $0.text.isEmpty)
-        }) {
-            let alert = NSAlert.make()
-            alert.messageText = "Save changes to \"\(doc.displayName)\"?"
-            alert.informativeText = "If you don't save, your changes will be lost."
-            alert.addButton(withTitle: "Save")
-            alert.addButton(withTitle: "Don't Save")
-            alert.addButton(withTitle: "Cancel")
-            alert.alertStyle = .warning
-            switch alert.runModal() {
-            case .alertFirstButtonReturn: doc.saveDocument()
-            case .alertThirdButtonReturn: return .terminateCancel
-            default: break
-            }
+        // The prompt itself now lives in SaveOnClose.swift, shared with the close
+        // path and Clear Session — closing a window used to reach none of this.
+        for doc in DocumentRegistry.shared.allDocuments() {
+            // Also cancels the quit when the user picks Save and then dismisses
+            // the save panel. That used to fall through and terminate anyway,
+            // discarding the very work they had just asked to keep.
+            guard resolveUnsavedWork(in: doc,
+                                     consequence: "If you don't save, your changes will be lost.")
+            else { return .terminateCancel }
         }
         AppState.shared.isTerminating = true
         let states = DocumentRegistry.shared.allStates()
@@ -292,6 +303,7 @@ extension Notification.Name {
     static let openFile          = Notification.Name("openFile")
     static let openSessionTab    = Notification.Name("openSessionTab")
     static let clearSession      = Notification.Name("clearSession")
+    static let reopenClosedTab   = Notification.Name("reopenClosedTab")
     // EASTER EGG: fired by findNext() when find text == "amatopad". To remove: delete this line.
     static let amatoPadModeChanged = Notification.Name("amatoPadModeChanged")
 }
@@ -364,6 +376,16 @@ struct NotepadCommands: Commands {
                 NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
             }
             .keyboardShortcut("t")
+            Button("Reopen Closed Tab") {
+                // Deliberately NOT .disabled() on hasClosedTab(): that reads
+                // non-observable state, and a menu item whose enablement SwiftUI
+                // cannot track is one that sticks in whatever state it was built
+                // with. Beeping on an empty buffer is the honest version.
+                guard SessionManager.shared.hasClosedTab() else { NSSound.beep(); return }
+                NotificationCenter.default.post(name: .reopenClosedTab, object: nil,
+                                                userInfo: ["token": UUID()])
+            }
+            .keyboardShortcut("T", modifiers: [.command, .shift])
             Button("New Window") {
                 NotificationCenter.default.post(name: .openNotepadWindow, object: nil)
             }
@@ -400,23 +422,13 @@ struct NotepadCommands: Commands {
             .disabled(document == nil)
             Divider()
             Button("Clear Session") {
-                // Prompt to save each modified document
-                // An untitled, empty document has nothing worth saving — don't nag about it.
-        for doc in DocumentRegistry.shared.allDocuments().filter({
-            $0.isModified && !($0.fileURL == nil && $0.text.isEmpty)
-        }) {
-                    let alert = NSAlert.make()
-                    alert.messageText = "Save changes to \"\(doc.displayName)\"?"
-                    alert.informativeText = "Your unsaved changes will be lost if you clear the session."
-                    alert.addButton(withTitle: "Save")
-                    alert.addButton(withTitle: "Don't Save")
-                    alert.addButton(withTitle: "Cancel")
-                    alert.alertStyle = .warning
-                    switch alert.runModal() {
-                    case .alertFirstButtonReturn: doc.saveDocument()
-                    case .alertThirdButtonReturn: return  // user hit Cancel
-                    default: break
-                    }
+                // Prompt to save each modified document. Same shared prompt the
+                // quit and window-close paths use — see SaveOnClose.swift.
+                for doc in DocumentRegistry.shared.allDocuments() {
+                    guard resolveUnsavedWork(
+                        in: doc,
+                        consequence: "Your unsaved changes will be lost if you clear the session."
+                    ) else { return }   // user cancelled
                 }
                 AppState.shared.isClearingSession = true
                 SessionManager.shared.clearSession()

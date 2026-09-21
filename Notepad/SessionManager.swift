@@ -79,6 +79,28 @@ final class SessionManager {
         UserDefaults.standard.set(data, forKey: key)
     }
 
+    /// Writes the session from whatever is open at this moment.
+    ///
+    /// Through 4.0 the only call to `save` was in applicationShouldTerminate, so
+    /// an untitled tab's text lived in memory and nowhere else for as long as the
+    /// app ran. Anything that ended that run without a clean quit took the work
+    /// with it — and so did closing a tab, which removed the document from the
+    /// registry before quit ever got a chance to look at it.
+    @MainActor
+    func persistOpenDocuments() {
+        // Under test the registry holds fixtures, and persisting those would
+        // overwrite the real session — the same reason quit skips its own save.
+        guard !TestEnvironment.isRunningUnitTests else { return }
+        save(states: DocumentRegistry.shared.allStates())
+    }
+
+    /// Puts a state at the front of the restore queue, for the next window that
+    /// claims one. Lets Reopen Closed Tab re-enter the existing restore path
+    /// instead of growing a second one beside it.
+    func enqueueForRestore(_ state: DocumentSessionState) {
+        pending.insert(state, at: 0)
+    }
+
     func resolveBookmark(_ data: Data) -> URL? {
         var stale = false
         guard let url = try? URL(
@@ -101,13 +123,21 @@ final class SessionManager {
 }
 
 // MARK: - Closed Tabs Buffer (LIFO — most recently closed restored first)
+//
+// This buffer had no reader for a while. A previous bug had new documents
+// helping themselves to it on creation, so New Tab would open a file you had
+// just closed, and disconnecting it was the fix. 4.0.1 connects it again, but
+// only behind File ▸ Reopen Closed Tab — an explicit command, which is what it
+// always needed. Nothing consumes it implicitly.
 
 extension SessionManager {
     private var closedTabsKey: String { "NotepadClosedTabs" }
 
     func pushClosed(_ state: DocumentSessionState) {
-        var states = loadClosedTabs()
-        states.append(state)
+        // Trimmed, because every entry carries the document's full text: an
+        // unbounded buffer would grow the preferences blob by a whole document
+        // on every close. See closedTabBufferLimit.
+        let states = trimmedClosedTabs(loadClosedTabs() + [state])
         if let data = try? JSONEncoder().encode(states) {
             UserDefaults.standard.set(data, forKey: closedTabsKey)
         }
