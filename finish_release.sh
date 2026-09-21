@@ -119,16 +119,10 @@ ITEM="        <item>
             <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
             <description><![CDATA[
                 <ul>
-                    <li>Files that aren't UTF-8 — a spreadsheet exported from Excel on Windows, say — now open properly instead of coming up blank. Saving keeps the file's original encoding and line endings.</li>
-                    <li>Saving an empty document over a file that still has content now asks first.</li>
-                    <li>Opening a file that isn't text is refused, rather than filling the window with garbage you could save over the original.</li>
-                    <li>Printing works. ⌘P prints the document, and a CSV prints as a real table with the column headings repeated on every page.</li>
-                    <li>Go to Line (⌘L) jumps to a line number, or to a row when a CSV is showing as a grid.</li>
-                    <li>The grid now uses the same monospaced font as the editor, so figures line up. Columns align themselves: numbers to the right, short entries like Yes/No centred, text to the left.</li>
-                    <li>Zoom (⌘+ and ⌘−) now works in grid view as well as the editor.</li>
-                    <li>Undo works in the grid — cell edits, row deletions and pastes can all be taken back.</li>
-                    <li>Insert Row and Duplicate Row added to the grid's right-click menu.</li>
-                    <li>Replace All now works in grid view instead of quietly throwing the replacements away.</li>
+                    <li>Closing a tab no longer throws away unsaved work. ⌘W and the red close button now ask before discarding changes, the way quitting always has — previously they just closed, with no warning and nothing kept.</li>
+                    <li>New: File ▸ Reopen Closed Tab (⇧⌘T) brings a closed tab back with its text intact, even one you closed by accident.</li>
+                    <li>Your open tabs are now saved when a window closes, not only when you quit.</li>
+                    <li>Quitting no longer discards your changes if you choose Save and then dismiss the save panel — it stops and waits instead.</li>
                 </ul>
             ]]></description>
             <pubDate>${PUBDATE}</pubDate>

@@ -6,6 +6,27 @@
         <description>Updates for Notepad</description>
         <language>en</language>
         <item>
+            <title>4.0.1</title>
+            <sparkle:version>32</sparkle:version>
+            <sparkle:shortVersionString>4.0.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[
+                <ul>
+                    <li>Closing a tab no longer throws away unsaved work. ⌘W and the red close button now ask before discarding changes, the way quitting always has — previously they just closed, with no warning and nothing kept.</li>
+                    <li>New: File ▸ Reopen Closed Tab (⇧⌘T) brings a closed tab back with its text intact, even one you closed by accident.</li>
+                    <li>Your open tabs are now saved when a window closes, not only when you quit.</li>
+                    <li>Quitting no longer discards your changes if you choose Save and then dismiss the save panel — it stops and waits instead.</li>
+                </ul>
+            ]]></description>
+            <pubDate>Mon, 21 Sep 2026 01:52:23 +0000</pubDate>
+            <enclosure url="https://github.com/samatojr/notepad-app/releases/download/v4.0.1/Notepad_4.0.1.zip"
+                       sparkle:version="32"
+                       sparkle:shortVersionString="4.0.1"
+                       sparkle:edSignature="photh8q/JDhiQaINPYhmJebPqqOZTU/9I8U80B+0GrLEHpkjO/d6djTg5Fw9GTyZW1Pt2eHHy9WN9nFv+QscBA=="
+                       length="4701709"
+                       type="application/octet-stream" />
+        </item>
+        <item>
             <title>4.0</title>
             <sparkle:version>31</sparkle:version>
             <sparkle:shortVersionString>4.0</sparkle:shortVersionString>
