@@ -78,7 +78,9 @@ nonisolated func needsSavePrompt(fileURL: URL?, isModified: Bool, text: String,
 /// the previous `pushClosed` appended forever, which would have grown the
 /// preferences blob by the size of a document on every close had anything been
 /// calling it.
-nonisolated let closedTabBufferLimit = 10
+/// Raised from 10 in 4.0.2: the buffer is now where aged-out scratch tabs live
+/// as well as ones closed by hand, so it has to hold a plausible backlog.
+nonisolated let closedTabBufferLimit = 40
 
 /// The buffer trimmed to `limit`, keeping the most recently closed entries.
 /// Newest is last, matching the LIFO pop.
