@@ -35,14 +35,41 @@ nonisolated func holdsUnsavedWork(fileURL: URL?, isModified: Bool, text: String)
     fileURL == nil ? !text.isEmpty : isModified
 }
 
-/// True when closing should stop and ask the user before going through with it.
+/// What a discard is about to do to the work, which decides whether it is worth
+/// stopping the user over.
+enum DiscardKind {
+    /// Closing a window, or quitting. Whatever is only in memory survives — in
+    /// the session, or in the closed-tab buffer — so there is nothing to warn
+    /// about except a file on disk going stale.
+    case recoverable
+    /// Clear Session. The session AND the recovery buffer are both wiped, so
+    /// anything only in memory really is about to cease to exist.
+    case permanent
+}
+
+/// True when a discard should stop and ask the user first.
 ///
-/// Deliberately narrower than `holdsUnsavedWork`: an untitled document carrying
-/// text it has not been edited since restore came out of the session and goes
-/// straight back into it, so a prompt would nag about work that was never at
-/// risk. Such a document is still snapshotted — recorded without interrupting.
-nonisolated func needsSavePrompt(fileURL: URL?, isModified: Bool, text: String) -> Bool {
-    isModified && !(fileURL == nil && text.isEmpty)
+/// The asymmetry is the whole point, and it is what makes this a scratch pad
+/// rather than a document editor wearing one's clothes:
+///
+///   - An UNTITLED tab is the app's core use — somewhere to keep loose text
+///     without ceremony. Its content is captured whole by the session, so
+///     closing costs nothing and asking is pure noise. Four scratch tabs used
+///     to mean four dialogs on the way out.
+///   - A NAMED file is different: its buffer has diverged from what is on disk,
+///     and the disk copy is what every other program on the machine will show.
+///     That divergence is worth a question.
+///
+/// A `permanent` discard drops the distinction, because then the scratch tab's
+/// safety net is going away too.
+nonisolated func needsSavePrompt(fileURL: URL?, isModified: Bool, text: String,
+                                 discard: DiscardKind = .recoverable) -> Bool {
+    switch discard {
+    case .recoverable:
+        return fileURL != nil && isModified
+    case .permanent:
+        return holdsUnsavedWork(fileURL: fileURL, isModified: isModified, text: text)
+    }
 }
 
 /// How many closed tabs the recovery buffer keeps.
@@ -51,7 +78,9 @@ nonisolated func needsSavePrompt(fileURL: URL?, isModified: Bool, text: String) 
 /// the previous `pushClosed` appended forever, which would have grown the
 /// preferences blob by the size of a document on every close had anything been
 /// calling it.
-nonisolated let closedTabBufferLimit = 10
+/// Raised from 10 in 4.0.2: the buffer is now where aged-out scratch tabs live
+/// as well as ones closed by hand, so it has to hold a plausible backlog.
+nonisolated let closedTabBufferLimit = 40
 
 /// The buffer trimmed to `limit`, keeping the most recently closed entries.
 /// Newest is last, matching the LIFO pop.

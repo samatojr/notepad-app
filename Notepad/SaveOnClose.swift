@@ -46,10 +46,12 @@ func promptToSave(_ document: NotepadDocument, consequence: String) -> SaveOnClo
 /// should be abandoned — either the user cancelled, or they chose Save and the
 /// save did not happen (an untitled document whose save panel they dismissed).
 @MainActor
-func resolveUnsavedWork(in document: NotepadDocument, consequence: String) -> Bool {
+func resolveUnsavedWork(in document: NotepadDocument, consequence: String,
+                        discard: DiscardKind = .recoverable) -> Bool {
     guard needsSavePrompt(fileURL: document.fileURL,
                           isModified: document.isModified,
-                          text: document.text) else { return true }
+                          text: document.text,
+                          discard: discard) else { return true }
 
     switch promptToSave(document, consequence: consequence) {
     case .cancel:

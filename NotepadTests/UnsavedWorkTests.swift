@@ -54,41 +54,80 @@ struct UnsavedWorkTests {
         #expect(holdsUnsavedWork(fileURL: file, isModified: true, text: ""))
     }
 
-    // MARK: - needsSavePrompt: should closing stop and ask?
+    // MARK: - needsSavePrompt: should the discard stop and ask?
 
-    @Test("Unsaved edits get a prompt")
-    func promptsForEdits() {
-        #expect(needsSavePrompt(fileURL: nil, isModified: true, text: "draft"))
-        #expect(needsSavePrompt(fileURL: file, isModified: true, text: "edited"))
-    }
-
-    @Test("Nothing to lose, nothing to ask")
-    func silentWhenClean() {
-        #expect(!needsSavePrompt(fileURL: file, isModified: false, text: "on disk"))
-        #expect(!needsSavePrompt(fileURL: nil, isModified: false, text: ""))
-        #expect(!needsSavePrompt(fileURL: nil, isModified: true, text: ""))
-    }
-
-    // Narrower than holdsUnsavedWork on purpose: this document goes back into
-    // the session untouched, so interrupting the user over it would be a nag
-    // about something that was never at risk. It is still snapshotted.
-    @Test("A restored, unedited tab is recorded without a prompt")
-    func restoredUntitledIsNotNagged() {
+    // The scratch pad's whole point. Closing or quitting keeps untitled text —
+    // in the session, or in the closed-tab buffer — so there is nothing to warn
+    // about. Four scratch tabs used to mean four dialogs on the way out, which
+    // is what made "just close it, it comes back" untrue in practice.
+    @Test("Scratch tabs are never nagged about on a recoverable discard")
+    func scratchIsSilent() {
+        #expect(!needsSavePrompt(fileURL: nil, isModified: true,  text: "draft"))
         #expect(!needsSavePrompt(fileURL: nil, isModified: false, text: "restored draft"))
-        #expect(holdsUnsavedWork(fileURL: nil, isModified: false, text: "restored draft"))
+        #expect(!needsSavePrompt(fileURL: nil, isModified: true,  text: ""))
     }
 
-    // The invariant that keeps the two predicates honest. If anything ever
-    // prompts without also being snapshotted, "Don't Save" becomes unrecoverable
-    // again — which is exactly the hole this release closes.
-    @Test("Anything worth a prompt is also worth keeping",
+    // A named file is the opposite case: the buffer has diverged from disk, and
+    // the disk copy is what every other program on the machine will show.
+    @Test("A named file with unsaved edits still asks")
+    func namedFileAsks() {
+        #expect(needsSavePrompt(fileURL: file, isModified: true, text: "edited"))
+        #expect(needsSavePrompt(fileURL: file, isModified: true, text: ""))
+    }
+
+    @Test("A clean file asks nothing")
+    func cleanFileSilent() {
+        #expect(!needsSavePrompt(fileURL: file, isModified: false, text: "on disk"))
+    }
+
+    // Clear Session wipes the session AND the recovery buffer, so the safety net
+    // that justifies staying quiet about scratch text is itself being removed.
+    @Test("A permanent discard asks about scratch text too")
+    func permanentDiscardAsksAboutScratch() {
+        #expect(needsSavePrompt(fileURL: nil, isModified: true, text: "draft",
+                                discard: .permanent))
+        #expect(needsSavePrompt(fileURL: nil, isModified: false, text: "restored draft",
+                                discard: .permanent))
+        // Still nothing to lose in an empty tab.
+        #expect(!needsSavePrompt(fileURL: nil, isModified: true, text: "",
+                                 discard: .permanent))
+    }
+
+    // The invariant that keeps the policy honest: a permanent discard must never
+    // destroy something silently. Anything holding work has to be offered first.
+    @Test("Nothing with work in it is permanently discarded without asking",
           arguments: [nil, URL(fileURLWithPath: "/tmp/notes.txt")] as [URL?],
           [true, false])
-    func promptImpliesSnapshot(url: URL?, modified: Bool) {
+    func permanentNeverSilentlyDestroys(url: URL?, modified: Bool) {
         for text in ["", "content"] {
-            if needsSavePrompt(fileURL: url, isModified: modified, text: text) {
-                #expect(holdsUnsavedWork(fileURL: url, isModified: modified, text: text))
+            if holdsUnsavedWork(fileURL: url, isModified: modified, text: text) {
+                #expect(needsSavePrompt(fileURL: url, isModified: modified, text: text,
+                                        discard: .permanent))
             }
+        }
+    }
+
+    // The counterpart, and the one that matters most: staying quiet must never
+    // mean losing something. Whatever the app declines to ask about has to be
+    // safe by some other route.
+    //
+    // There are exactly three ways silence is safe, and a document that is none
+    // of them would be discarded without a word:
+    //   - it is snapshotted into the session or the recovery buffer;
+    //   - it is empty, so there is nothing to lose;
+    //   - it is a CLEAN file-backed document, whose text is on disk already.
+    // That last one is why this is not simply "silence implies snapshot" —
+    // asserting that was wrong, and this test caught it.
+    @Test("Staying quiet never means losing something",
+          arguments: [nil, URL(fileURLWithPath: "/tmp/notes.txt")] as [URL?],
+          [true, false])
+    func silenceIsAlwaysSafe(url: URL?, modified: Bool) {
+        for text in ["", "content"] {
+            let asked = needsSavePrompt(fileURL: url, isModified: modified, text: text)
+            let kept  = holdsUnsavedWork(fileURL: url, isModified: modified, text: text)
+            guard !asked, !kept else { continue }
+            let alreadyOnDisk = url != nil && !modified
+            #expect(text.isEmpty || alreadyOnDisk)
         }
     }
 

@@ -28,6 +28,18 @@ struct DocumentSessionState: Codable {
     // "assume UTF-8 / LF", which is what those builds always did.
     var fileEncoding: String?
     var lineEnding: String?
+    /// The launch this document was last EDITED in — not merely present for.
+    /// Drives ageing; see SessionRetention.swift. Optional so pre-4.0.2 sessions
+    /// still decode, and a missing stamp always means "restore".
+    var lastEditedLaunch: Int?
+    /// Which tab group this document's window belonged to, numbered in the order
+    /// the groups were first seen; nil for a window standing on its own.
+    ///
+    /// Without this the session was a flat list and the ARRANGEMENT could not
+    /// survive a quit: two windows of two tabs came back as one window of four.
+    /// The content was all there, in the wrong shape. Optional so sessions
+    /// written before 4.0.2 still decode — they simply restore ungrouped.
+    var windowGroup: Int?
 
     /// An untitled document with no text has nothing to restore — it comes back as a
     /// blank "Untitled" window. Recording those means a quit persists whatever blank
@@ -45,6 +57,8 @@ final class SessionManager {
 
     private let key = "NotepadSession"
     private var pending: [DocumentSessionState] = []
+    /// The last blob written, so an unchanged session costs nothing to re-save.
+    private var lastSavedBlob: Data?
 
     func loadAndEnqueue() {
         guard let data = UserDefaults.standard.data(forKey: key),
@@ -53,8 +67,21 @@ final class SessionManager {
         // Filter on the way in as well as on the way out: sessions written by builds
         // before this filter existed still hold blank entries, and each one would
         // reopen as an empty window.
-        pending = states.filter(\.isWorthRestoring)
-                        .sorted { $0.windowIndex < $1.windowIndex }
+        let worthKeeping = states.filter(\.isWorthRestoring)
+                                 .sorted { $0.windowIndex < $1.windowIndex }
+
+        // Scratch tabs nobody has touched for a couple of runs stop reopening as
+        // windows and go to the recovery buffer instead — see
+        // SessionRetention.swift. Archived, never deleted: ⇧⌘T still has them.
+        let split = partitionSessionByAge(
+            lastEdited: worthKeeping.map(\.lastEditedLaunch),
+            isNamedFile: worthKeeping.map { $0.bookmarkData != nil },
+            currentLaunch: LaunchCounter.current
+        )
+        pending = split.restore.map { worthKeeping[$0] }
+        // Oldest first, so the most recently abandoned tab is the first one ⇧⌘T
+        // brings back.
+        for index in split.archive { pushClosed(worthKeeping[index]) }
     }
 
     func popPending() -> DocumentSessionState? {
@@ -76,8 +103,14 @@ final class SessionManager {
     func save(states: [DocumentSessionState]) {
         let worthKeeping = states.filter(\.isWorthRestoring)
         guard let data = try? JSONEncoder().encode(worthKeeping) else { return }
+        // Skip a write that would change nothing. The session is now saved on a
+        // timer as well as at quit, and most ticks find nothing new — without
+        // this, idling would rewrite the whole blob every few seconds.
+        guard data != lastSavedBlob else { return }
+        lastSavedBlob = data
         UserDefaults.standard.set(data, forKey: key)
     }
+
 
     /// Writes the session from whatever is open at this moment.
     ///
@@ -188,13 +221,10 @@ final class PendingURLManager {
     /// (they often differ, and a window may never capture its own reference), so
     /// each broadcast carries a token and the first view to claim it handles the
     /// file. Guarantees exactly one open, and that it is never silently dropped.
-    private var claimedTokens: Set<UUID> = []
+    private var tokens = OneShotTokens()
 
     func claim(_ token: UUID) -> Bool {
-        guard !claimedTokens.contains(token) else { return false }
-        claimedTokens.insert(token)
-        if claimedTokens.count > 64 { claimedTokens.removeAll() }
-        return true
+        tokens.claim(token)
     }
 }
 
@@ -209,13 +239,10 @@ final class SessionTabClaims {
     static let shared = SessionTabClaims()
     private init() {}
 
-    private var claimedTokens: Set<UUID> = []
+    private var tokens = OneShotTokens()
 
     func claim(_ token: UUID) -> Bool {
-        guard !claimedTokens.contains(token) else { return false }
-        claimedTokens.insert(token)
-        if claimedTokens.count > 64 { claimedTokens.removeAll() }
-        return true
+        tokens.claim(token)
     }
 }
 

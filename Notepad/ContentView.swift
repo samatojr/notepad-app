@@ -52,6 +52,11 @@ final class NotepadDocument {
 
     var isBeingExplicitlyClosed: Bool = false  // set true when user deliberately closes; skips session restore
 
+    /// The tab group this document came back into, from the session. Restore
+    /// deliberately makes every window standalone and then merges them by this
+    /// number, so grouping is only ever added, never unpicked.
+    var restoredWindowGroup: Int?
+
     /// One-shot request for the view to select and scroll to a range. The id
     /// makes a repeat of the same range fire again — asking to go to line 40
     /// twice must scroll twice, and comparing ranges alone would swallow it.
@@ -153,6 +158,11 @@ final class NotepadDocument {
         wordWrap      = state.wordWrap
         showStatusBar = state.showStatusBar
         windowIndex   = state.windowIndex
+        restoredWindowGroup = state.windowGroup
+        // Carried over, NOT refreshed: a tab that merely came back from the
+        // session has not been edited, and stamping it here would stop it ever
+        // ageing out.
+        lastEditedLaunch = state.lastEditedLaunch ?? LaunchCounter.current
         fontSize      = state.fontSize ?? 13
         fileEncoding  = state.fileEncoding.flatMap(FileEncoding.init(rawValue:)) ?? .utf8
         lineEnding    = state.lineEnding.flatMap(LineEnding.init(rawValue:))     ?? .lf
@@ -215,7 +225,21 @@ final class NotepadDocument {
         }
     }
 
-    func markModified() { isModified = true }
+    /// The launch this document was last edited in. Restored from the session so
+    /// an untouched tab keeps ageing across runs; refreshed on every edit.
+    var lastEditedLaunch: Int = LaunchCounter.current
+
+    func markModified() {
+        isModified = true
+        noteEdited()
+    }
+
+    /// Stamps this document as touched in the current launch. Called from every
+    /// path that changes the buffer, so "last edited" means what it says rather
+    /// than "last seen open".
+    func noteEdited() {
+        lastEditedLaunch = LaunchCounter.current
+    }
 
     func reset() {
         text = ""; fileURL = nil; bookmarkData = nil
@@ -232,7 +256,7 @@ final class NotepadDocument {
         fileEncoding = .utf8; lineEnding = .lf
     }
 
-    func sessionState(index: Int) -> DocumentSessionState {
+    func sessionState(index: Int, windowGroup: Int? = nil) -> DocumentSessionState {
         DocumentSessionState(
             sessionID: sessionID,
             // Cache the buffer whenever it differs from disk. Previously only
@@ -248,7 +272,9 @@ final class NotepadDocument {
             csvIsTableView: csvDelimiter != nil ? csvIsTableView : nil,
             csvSortKeys: csvSortKeys.isEmpty ? nil : csvSortKeys,
             fileEncoding: fileEncoding.rawValue,
-            lineEnding: lineEnding.rawValue
+            lineEnding: lineEnding.rawValue,
+            lastEditedLaunch: lastEditedLaunch,
+            windowGroup: windowGroup
         )
     }
 
@@ -679,8 +705,44 @@ final class DocumentRegistry {
         // SessionDeduplication.swift. Doing it here also heals sessions that are
         // already bloated, on the next quit.
         let kept = indicesKeepingFirstPerURL(ordered.map(\.fileURL))
+        // Number the tab groups in the order they are first seen, so the
+        // arrangement — not just the documents — can be put back. A window that
+        // is not tabbed with anything gets nil and restores standalone.
+        var numbers: [ObjectIdentifier: Int] = [:]
+        func groupNumber(for doc: NotepadDocument) -> Int? {
+            guard let window = window(for: doc),
+                  let group = window.tabGroup,
+                  group.windows.count > 1 else { return nil }
+            let id = ObjectIdentifier(group)
+            if let existing = numbers[id] { return existing }
+            let next = numbers.count
+            numbers[id] = next
+            return next
+        }
         return kept.enumerated().map { position, index in
-            ordered[index].sessionState(index: position)
+            ordered[index].sessionState(index: position,
+                                        windowGroup: groupNumber(for: ordered[index]))
+        }
+    }
+
+    /// Rebuilds the tab groups the session recorded.
+    ///
+    /// Restore opens every document in its own window and this merges them
+    /// afterwards, so grouping is only ever ADDED. Splitting an over-merged
+    /// group would mean driving moveTabToNewWindow and hoping; adding is a
+    /// single call that either works or leaves a standalone window, which is
+    /// the same thing the app did before any of this existed.
+    @MainActor
+    func regroupRestoredWindows() {
+        var host: [Int: NSWindow] = [:]
+        for doc in documents.values.sorted(by: { $0.windowIndex < $1.windowIndex }) {
+            guard let group = doc.restoredWindowGroup,
+                  let window = window(for: doc) else { continue }
+            if let existing = host[group], existing !== window {
+                existing.addTabbedWindow(window, ordered: .above)
+            } else {
+                host[group] = window
+            }
         }
     }
 
@@ -796,7 +858,12 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
 
     private var windowTitle: String {
-        document.isModified ? "\(document.displayName) — Edited" : document.displayName
+        // "Edited" only means something when there is a saved file to be edited
+        // away from. An untitled scratch tab is never in a state worth flagging:
+        // it has no on-disk copy to differ from, and the session keeps it either
+        // way, so the marker was permanent and meaningless.
+        guard document.fileURL != nil, document.isModified else { return document.displayName }
+        return "\(document.displayName) — Edited"
     }
 
     var body: some View {
@@ -923,6 +990,12 @@ struct ContentView: View {
             guard NSApp.keyWindow == myWindow else { return }
             openNewWindow()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .openNotepadTab)) { _ in
+            // The key window is the one the user is looking at, and the new tab
+            // belongs beside it.
+            guard NSApp.keyWindow == myWindow else { return }
+            openNewTab()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .openSessionTab)) { note in
             // Claimed by token rather than by window identity, for the same reason
             // .openFile is: at launch NSApp.keyWindow is routinely some window other
@@ -933,7 +1006,10 @@ struct ContentView: View {
             } else {
                 guard NSApp.keyWindow == myWindow else { return }
             }
-            openNewTab()
+            // Standalone, NOT a tab. The saved tab groups are rebuilt afterwards
+            // by regroupRestoredWindows(); tabbing everything together here is
+            // what used to collapse two windows of two tabs into one of four.
+            openWindow(id: "notepad")
         }
         .onReceive(NotificationCenter.default.publisher(for: .reopenClosedTab)) { note in
             // Token-claimed like the others, so exactly one window answers.
@@ -1008,21 +1084,39 @@ struct ContentView: View {
     }
 
     private func openNewTab() {
-        let existingIDs = Set(NSApp.windows.map { ObjectIdentifier($0) })
-        var observer: NSObjectProtocol?
-        observer = NotificationCenter.default.addObserver(
-            forName: NSWindow.didBecomeKeyNotification,
-            object: nil,
-            queue: .main
-        ) { notification in
-            guard let newWin = notification.object as? NSWindow,
-                  !existingIDs.contains(ObjectIdentifier(newWin)) else { return }
-            if let obs = observer { NotificationCenter.default.removeObserver(obs) }
-            observer = nil
-            myWindow?.addTabbedWindow(newWin, ordered: .above)
-            newWin.makeKeyAndOrderFront(nil)
-        }
+        let existing = Set(NSApp.windows.map { ObjectIdentifier($0) })
         openWindow(id: "notepad")
+        attachAsTab(excluding: existing, attempt: 0)
+    }
+
+    /// Finds the window SwiftUI just made and tabs it onto this one.
+    ///
+    /// This used to hang off a one-shot didBecomeKeyNotification observer, which
+    /// is not a guarantee: if the new window never became key — or something
+    /// else became key first — the observer never fired and the "tab" was left
+    /// standing as its own window. ⌘T producing a window instead of a tab was
+    /// exactly that race, and it lost often enough to see by hand.
+    ///
+    /// Polling is deterministic. It also copes with SwiftUI taking its time,
+    /// which the single notification never could.
+    private func attachAsTab(excluding existing: Set<ObjectIdentifier>, attempt: Int) {
+        guard attempt < 40 else { return }        // ~2s, then leave it standalone
+        let fresh = NSApp.windows.first {
+            !existing.contains(ObjectIdentifier($0))
+                && !($0 is NSPanel)               // not a save panel or an alert
+                && $0.contentView != nil
+                && $0 !== myWindow
+        }
+        guard let host = myWindow, let newWin = fresh else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                attachAsTab(excluding: existing, attempt: attempt + 1)
+            }
+            return
+        }
+        if newWin.tabGroup !== host.tabGroup || host.tabGroup == nil {
+            host.addTabbedWindow(newWin, ordered: .above)
+        }
+        newWin.makeKeyAndOrderFront(nil)
     }
 
     private func openNewWindow() {
@@ -1134,6 +1228,15 @@ private struct WindowAccessor: NSViewRepresentable {
             }
             window.tabbingMode = .preferred
             window.tabbingIdentifier = "NotepadMain"
+            // Notepad restores its own windows from the session, and AppKit must
+            // not also try. Registering NSQuitAlwaysKeepsWindows = false stops it
+            // doing so after a QUIT, but an abrupt end is a different path: kill
+            // the app with four windows open and the next launch put up four
+            // EMPTY ones, from AppKit's restorable state, on top of whatever the
+            // session did. Reproduced at 4 windows and at 133. Opting each window
+            // out of restorable state leaves the session as the single source of
+            // what should reopen.
+            window.isRestorable = false
             onWindow(window)
         }
     }

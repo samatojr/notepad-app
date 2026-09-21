@@ -11,12 +11,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Restore previous session tabs
         let extraCount = SessionManager.shared.pendingCount()
         if extraCount > 0 {
+            // Restored windows come back standalone and are merged into their
+            // saved tab groups at the end. Left to itself AppKit would tab each
+            // new window onto the last, which is the arrangement, decided for us.
+            NSWindow.allowsAutomaticWindowTabbing = false
+            // The ladder keeps window creation sequential. It used to be 0.15s a
+            // rung, which put a floor of twenty seconds under a 130-tab session
+            // before any window had been drawn.
+            let rung = 0.06
             for i in 0..<extraCount {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + Double(i) * 0.15) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3 + Double(i) * rung) {
                     // The token lets exactly one window claim this tab — see SessionTabClaims.
                     NotificationCenter.default.post(name: .openSessionTab, object: nil,
                                                     userInfo: ["token": UUID()])
                 }
+            }
+            let settled = 0.3 + Double(extraCount) * rung + 1.2
+            DispatchQueue.main.asyncAfter(deadline: .now() + settled) {
+                NSWindow.allowsAutomaticWindowTabbing = true
+                DocumentRegistry.shared.regroupRestoredWindows()
             }
         }
         // Set the correct icon for the current appearance and watch for changes
@@ -38,6 +51,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
+        startSessionAutosave()
+
         // A window closing is the moment a document's unsaved text is either
         // kept or lost for good, and nothing in the app was watching for it.
         // See SaveOnClose.swift.
@@ -56,6 +71,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.applyAmatoPadAppearance()
             }
         }
+    }
+
+    // MARK: Autosave
+    //
+    // Through 4.0.1 the session was written when a window closed and when the
+    // app quit, and nowhere else. Every other way a run can end — a crash, a
+    // force-quit, a power cut, the updater restarting the app — took the only
+    // copy of every scratch tab with it, because that copy was in memory.
+    // "Close it and it comes back" was true for exactly one of the ways a run
+    // ends, which is not what the app promises.
+    private var autosaveTimer: Timer?
+
+    /// Ten seconds is the most recent work that an abrupt end can now cost.
+    /// Target/selector rather than a closure to keep the timer out of the
+    /// actor-isolation weeds; it fires on the main run loop either way.
+    private func startSessionAutosave() {
+        guard !TestEnvironment.isRunningUnitTests else { return }
+        autosaveTimer = Timer.scheduledTimer(timeInterval: 10, target: self,
+                                             selector: #selector(autosaveSession),
+                                             userInfo: nil, repeats: true)
+    }
+
+    @objc private func autosaveSession() {
+        SessionManager.shared.persistOpenDocuments()
+    }
+
+    /// Switching away from the app is the likeliest quiet moment before
+    /// something goes wrong, so take the free checkpoint.
+    func applicationDidResignActive(_ notification: Notification) {
+        guard !TestEnvironment.isRunningUnitTests else { return }
+        SessionManager.shared.persistOpenDocuments()
     }
 
     /// Fires for every window in the app. Only document windows are in the
@@ -233,8 +279,12 @@ struct NotepadApp: App {
         // so it must not touch the real session: loadAndEnqueue would reopen the
         // user's windows and clearClosedTabs writes straight to their defaults.
         if !TestEnvironment.isRunningUnitTests {
+            // Before loadAndEnqueue, which ages entries against this number.
+            _ = LaunchCounter.advance()
             SessionManager.shared.loadAndEnqueue()
-            SessionManager.shared.clearClosedTabs()
+            // NOT cleared any more: the buffer is where aged-out scratch tabs
+            // are kept, and wiping it on launch would throw away exactly what
+            // retention just decided to hold on to.
         }
         // Sparkle runs only in Release builds of the shipping app.
         //
@@ -304,6 +354,7 @@ extension Notification.Name {
     static let openSessionTab    = Notification.Name("openSessionTab")
     static let clearSession      = Notification.Name("clearSession")
     static let reopenClosedTab   = Notification.Name("reopenClosedTab")
+    static let openNotepadTab    = Notification.Name("openNotepadTab")
     // EASTER EGG: fired by findNext() when find text == "amatopad". To remove: delete this line.
     static let amatoPadModeChanged = Notification.Name("amatoPadModeChanged")
 }
@@ -373,7 +424,12 @@ struct NotepadCommands: Commands {
             Button("New") { target?.newDocument() }
                 .keyboardShortcut("n")
             Button("New Tab") {
-                NSApp.sendAction(Selector(("newWindowForTab:")), to: nil, from: nil)
+                // Was NSApp.sendAction(newWindowForTab:), which asks AppKit to
+                // make the tab and depends on the frontmost window answering.
+                // With SwiftUI's WindowGroup windows that is unreliable — ⌘T
+                // produced a separate window about as often as a tab. The app
+                // makes the window itself now and tabs it deliberately.
+                NotificationCenter.default.post(name: .openNotepadTab, object: nil)
             }
             .keyboardShortcut("t")
             Button("Reopen Closed Tab") {
@@ -425,9 +481,14 @@ struct NotepadCommands: Commands {
                 // Prompt to save each modified document. Same shared prompt the
                 // quit and window-close paths use — see SaveOnClose.swift.
                 for doc in DocumentRegistry.shared.allDocuments() {
+                    // .permanent: this is the one action that wipes the session
+                    // AND the recovery buffer, so even scratch text — which
+                    // closing and quitting no longer ask about — is genuinely
+                    // about to be destroyed and has to be offered first.
                     guard resolveUnsavedWork(
                         in: doc,
-                        consequence: "Your unsaved changes will be lost if you clear the session."
+                        consequence: "Your unsaved changes will be lost if you clear the session.",
+                        discard: .permanent
                     ) else { return }   // user cancelled
                 }
                 AppState.shared.isClearingSession = true

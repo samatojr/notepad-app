@@ -16,8 +16,8 @@
 
 set -euo pipefail
 
-VERSION="4.0.1"
-BUILD="32"
+VERSION="4.0.2"
+BUILD="33"
 REPO="samatojr/notepad-app"
 DIR="/tmp/np-release"
 APP="$DIR/Notepad.app"
@@ -119,10 +119,12 @@ ITEM="        <item>
             <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
             <description><![CDATA[
                 <ul>
-                    <li>Closing a tab no longer throws away unsaved work. ⌘W and the red close button now ask before discarding changes, the way quitting always has — previously they just closed, with no warning and nothing kept.</li>
-                    <li>New: File ▸ Reopen Closed Tab (⇧⌘T) brings a closed tab back with its text intact, even one you closed by accident.</li>
-                    <li>Your open tabs are now saved when a window closes, not only when you quit.</li>
-                    <li>Quitting no longer discards your changes if you choose Save and then dismiss the save panel — it stops and waits instead.</li>
+                    <li>Close Notepad with several tabs open and they all come back where you left them — including the window arrangement. Two windows of two tabs used to return as one window of four.</li>
+                    <li>Scratch tabs no longer ask to be saved. Closing or quitting with four untitled tabs open asked four times; now it asks nothing and simply brings them back. Named files still ask, because their changes affect a real file on disk.</li>
+                    <li>Your tabs now survive a crash or a force-quit, not just a tidy quit. The session is saved every few seconds instead of only on the way out.</li>
+                    <li>After an unexpected quit, Notepad no longer reopens a pile of empty windows.</li>
+                    <li>⌘T reliably opens a tab. It sometimes opened a separate window instead.</li>
+                    <li>Scratch tabs you haven't touched for a couple of sessions stop reopening on their own — they move to File ▸ Reopen Closed Tab (⇧⌘T) rather than being discarded. Saved files are never aged out.</li>
                 </ul>
             ]]></description>
             <pubDate>${PUBDATE}</pubDate>
