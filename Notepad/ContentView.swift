@@ -1228,6 +1228,15 @@ private struct WindowAccessor: NSViewRepresentable {
             }
             window.tabbingMode = .preferred
             window.tabbingIdentifier = "NotepadMain"
+            // Notepad restores its own windows from the session, and AppKit must
+            // not also try. Registering NSQuitAlwaysKeepsWindows = false stops it
+            // doing so after a QUIT, but an abrupt end is a different path: kill
+            // the app with four windows open and the next launch put up four
+            // EMPTY ones, from AppKit's restorable state, on top of whatever the
+            // session did. Reproduced at 4 windows and at 133. Opting each window
+            // out of restorable state leaves the session as the single source of
+            // what should reopen.
+            window.isRestorable = false
             onWindow(window)
         }
     }
