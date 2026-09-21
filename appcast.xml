@@ -6,6 +6,29 @@
         <description>Updates for Notepad</description>
         <language>en</language>
         <item>
+            <title>4.0.2</title>
+            <sparkle:version>33</sparkle:version>
+            <sparkle:shortVersionString>4.0.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
+            <description><![CDATA[
+                <ul>
+                    <li>Close Notepad with several tabs open and they all come back where you left them — including the window arrangement. Two windows of two tabs used to return as one window of four.</li>
+                    <li>Scratch tabs no longer ask to be saved. Closing or quitting with four untitled tabs open asked four times; now it asks nothing and simply brings them back. Named files still ask, because their changes affect a real file on disk.</li>
+                    <li>Your tabs now survive a crash or a force-quit, not just a tidy quit. The session is saved every few seconds instead of only on the way out.</li>
+                    <li>After an unexpected quit, Notepad no longer reopens a pile of empty windows.</li>
+                    <li>⌘T reliably opens a tab. It sometimes opened a separate window instead.</li>
+                    <li>Scratch tabs you haven't touched for a couple of sessions stop reopening on their own — they move to File ▸ Reopen Closed Tab (⇧⌘T) rather than being discarded. Saved files are never aged out.</li>
+                </ul>
+            ]]></description>
+            <pubDate>Mon, 21 Sep 2026 02:49:24 +0000</pubDate>
+            <enclosure url="https://github.com/samatojr/notepad-app/releases/download/v4.0.2/Notepad_4.0.2.zip"
+                       sparkle:version="33"
+                       sparkle:shortVersionString="4.0.2"
+                       sparkle:edSignature="8WMpRsnD1UoIGfYk6K7qy1RUHZATGYUCEIfc31ZpnnL8LxVhMjqXDcELKIf7SW1XZBA8eV77rJLSCYfXvHEDBg=="
+                       length="4716507"
+                       type="application/octet-stream" />
+        </item>
+        <item>
             <title>4.0.1</title>
             <sparkle:version>32</sparkle:version>
             <sparkle:shortVersionString>4.0.1</sparkle:shortVersionString>
