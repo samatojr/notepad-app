@@ -394,6 +394,62 @@ extension FocusedValues {
     @Entry var notepadDocument: NotepadDocument? = nil
 }
 
+// MARK: - Table menu state
+
+/// What the Table menu can act on right now.
+///
+/// Built only from document properties the grid publishes as the selection
+/// and sort change. They are all observable, so SwiftUI rebuilds the menu when
+/// they move.
+struct GridMenuState {
+    var isGrid = false
+    var showsHeaders = true
+    var isSorted = false
+    var dataRows = 0
+    /// Separate pieces selected — more than one after ⌘-clicking cells apart.
+    var pieces = 0
+    /// The tallest and widest single piece. Fill works piece by piece, so it
+    /// needs one piece at least two rows tall (or two columns wide).
+    var tallestPiece = 0
+    var widestPiece = 0
+    /// Columns touched by any piece — what Join and Split act on.
+    var distinctColumns = 0
+    /// Every piece runs the full height of the grid.
+    var wholeColumns = false
+    /// First and last selected rows as displayed, for a single piece. Only
+    /// meaningful unsorted, the only time they are used: a sorted grid can't move rows.
+    private var topRow = 0
+    private var bottomRow = 0
+
+    init(_ doc: NotepadDocument?) {
+        guard let doc, doc.csvIsTableView, !doc.csvRows.isEmpty else { return }
+        isGrid = true
+        showsHeaders = doc.csvShowHeaders
+        isSorted = !doc.csvSortKeys.isEmpty
+        let offset = doc.csvShowHeaders ? 1 : 0
+        dataRows = max(0, doc.csvRows.count - offset)
+
+        let blocks = doc.csvSelectionBlocks
+        pieces = blocks.count
+        tallestPiece = blocks.map(\.rows.count).max() ?? 0
+        widestPiece = blocks.map(\.columns.count).max() ?? 0
+        distinctColumns = Set(blocks.flatMap { Array($0.columns) }).count
+        wholeColumns = !blocks.isEmpty && blocks.allSatisfy { $0.rows.count == dataRows }
+        if blocks.count == 1, let first = blocks[0].rows.min(), let last = blocks[0].rows.max() {
+            topRow = first - offset
+            bottomRow = last - offset
+        }
+    }
+
+    var hasSelection: Bool { pieces > 0 }
+    /// One rectangle — what "before the selection" and moving rows need.
+    var isSinglePiece: Bool { pieces == 1 }
+    // Left enabled while sorted: choosing it explains why rows can't move and
+    // offers Keep Sorted Order, which beats an item that is grey for no stated reason.
+    var canMoveUp: Bool   { isSinglePiece && (isSorted || topRow > 0) }
+    var canMoveDown: Bool { isSinglePiece && (isSorted || bottomRow < dataRows - 1) }
+}
+
 // MARK: - Commands
 
 struct NotepadCommands: Commands {
@@ -548,42 +604,88 @@ struct NotepadCommands: Commands {
         // The grid operations existed only in context menus, which meant a user who
         // did not think to right-click never found them at all. Every item here is
         // dispatched up the responder chain with NSApp.sendAction(_:to:from:), so
-        // it reaches the grid that has focus and nothing else — a plain text
-        // document simply never answers, and the item validates as disabled.
+        // it reaches the grid that has focus and nothing else.
+        //
+        // Enablement comes from GridMenuState, which reads only OBSERVABLE document
+        // state the grid publishes. The first attempt read NSApp.keyWindow, which
+        // SwiftUI cannot track, so items stuck in whatever state they were built in.
         CommandMenu("Table") {
+            let grid = GridMenuState(document)
+
             Button("Fill Down")  { sendToGrid(#selector(CopyableTableView.fillDownAction(_:))) }
                 .keyboardShortcut("d")
+                .disabled(grid.tallestPiece < 2)
             Button("Fill Right") { sendToGrid(#selector(CopyableTableView.fillRightAction(_:))) }
                 .keyboardShortcut("r")
+                .disabled(grid.widestPiece < 2)
+            Button("Fill Series") { sendToGrid(#selector(CopyableTableView.fillSeriesAction(_:))) }
+                .disabled(grid.tallestPiece < 2)
+
+            Divider()
+
+            Button("New Column from Calculation…") {
+                sendToGrid(#selector(CopyableTableView.calculateAction(_:)))
+            }
+            .disabled(!grid.isGrid)
+            Button("Add Totals Row") { sendToGrid(#selector(CopyableTableView.totalsAction(_:))) }
+                .disabled(grid.dataRows == 0)
+            Menu("Text") {
+                Button("Trim Spaces") { sendToGrid(#selector(CopyableTableView.trimSpacesAction(_:))) }
+                Button("UPPERCASE")   { sendToGrid(#selector(CopyableTableView.uppercaseAction(_:))) }
+                Button("lowercase")   { sendToGrid(#selector(CopyableTableView.lowercaseAction(_:))) }
+                Button("Title Case")  { sendToGrid(#selector(CopyableTableView.titleCaseAction(_:))) }
+                Divider()
+                Button("Join Columns…") { sendToGrid(#selector(CopyableTableView.joinColumnsAction(_:))) }
+                    .disabled(grid.distinctColumns < 2)
+                Button("Split Column…") { sendToGrid(#selector(CopyableTableView.splitColumnAction(_:))) }
+                    .disabled(grid.distinctColumns != 1)
+            }
+            .disabled(!grid.hasSelection)
 
             Divider()
 
             Button("Insert Column Before") {
                 sendToGrid(#selector(CopyableTableView.insertColumnBeforeAction(_:)))
             }
+            .disabled(!grid.isSinglePiece)
             Button("Insert Column After") {
                 sendToGrid(#selector(CopyableTableView.insertColumnAfterAction(_:)))
             }
+            .disabled(!grid.isSinglePiece)
             Button("Delete Columns") {
                 sendToGrid(#selector(CopyableTableView.deleteColumnsAction(_:)))
             }
+            .disabled(!grid.wholeColumns)
             Button("Rename Column…") {
                 sendToGrid(#selector(CopyableTableView.renameColumnAction(_:)))
             }
+            .disabled(!grid.isSinglePiece || !grid.showsHeaders)
 
             Divider()
 
             Button("Insert Row") { sendToGrid(#selector(CopyableTableView.insertRowAction(_:))) }
+                .disabled(!grid.isGrid)
             Button("Duplicate Rows") {
                 sendToGrid(#selector(CopyableTableView.duplicateRowsAction(_:)))
             }
+            .disabled(!grid.hasSelection)
+            Button("Move Rows Up") { sendToGrid(#selector(CopyableTableView.moveRowsUpAction(_:))) }
+                .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+                .disabled(!grid.canMoveUp)
+            Button("Move Rows Down") { sendToGrid(#selector(CopyableTableView.moveRowsDownAction(_:))) }
+                .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+                .disabled(!grid.canMoveDown)
             Button("Delete Rows") {
                 sendToGrid(#selector(CopyableTableView.deleteRowsAction(_:)))
             }
+            .disabled(!grid.hasSelection)
 
             Divider()
 
+            Button("Keep Sorted Order") { sendToGrid(#selector(CopyableTableView.keepSortAction(_:))) }
+                .disabled(!grid.isSorted)
             Button("Clear Sort") { sendToGrid(#selector(CopyableTableView.clearSortAction(_:))) }
+                .disabled(!grid.isSorted)
         }
 
         CommandGroup(after: .toolbar) {

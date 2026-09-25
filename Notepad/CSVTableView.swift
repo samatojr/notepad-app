@@ -53,6 +53,12 @@ final class GridHeaderView: NSTableHeaderView {
     var onSortColumn: ((Int) -> Void)?
 
     override func mouseDown(with event: NSEvent) {
+        // Ctrl-click is a right-click here too, not a column selection.
+        if event.modifierFlags.contains(.control) {
+            if let menu = menu(for: event) { NSMenu.popUpContextMenu(menu, with: event, for: self) }
+            return
+        }
+
         let point = convert(event.locationInWindow, from: nil)
         let index = column(at: point)
         guard index >= 0, index < tableView?.tableColumns.count ?? 0,
@@ -137,22 +143,59 @@ final class CopyableTableView: NSTableView {
     var fillRightHandler: (() -> Void)?
     var clearSortHandler: (() -> Void)?
 
+    // 4.1 quick actions. Column-taking handlers receive the column the context
+    // menu was opened over, or nil from the menu bar to mean "the selection".
+    var fillSeriesHandler:   (() -> Void)?
+    var calculateHandler:    ((Int?) -> Void)?
+    var totalsHandler:       (() -> Void)?
+    var transformHandler:    ((TextTransform) -> Void)?
+    var joinColumnsHandler:  (() -> Void)?
+    var splitColumnHandler:  ((Int?) -> Void)?
+    var moveRowsHandler:     ((Int) -> Void)?          // -1 up, +1 down
+    var keepSortHandler:     (() -> Void)?
+    /// Asked before a row drag starts. False means the grid is sorted, and the
+    /// handler explains why the rows can't move instead of starting the drag.
+    var rowMoveAllowed:      (() -> Bool)?
+    var rowMoveRefused:      (() -> Void)?
+    /// Statistics for the context menu, and where a clicked one goes.
+    var summaryProvider:     (() -> SelectionSummary?)?
+    var copyStatisticHandler: ((_ value: String, _ name: String) -> Void)?
+
     var selectionChanged: (() -> Void)?
     var beginEditRequested: ((Int, Int) -> Void)?
 
     /// Number of data columns, excluding the row-number column. Set by
     /// rebuildColumns so whole-row selection knows how far right to reach.
-    var dataColumnCount: Int = 0
+    var dataColumnCount: Int = 0 {
+        // A change of shape leaves ⌘-clicked pieces addressing columns that
+        // moved; the operations that change shape reselect what they made.
+        didSet { if dataColumnCount != oldValue { extraPieces = [] } }
+    }
 
     private(set) var anchor: GridCellAddress?
     private(set) var focus:  GridCellAddress?
     private(set) var span:   SelectionSpan = .cells
 
+    /// One rectangle of the selection, kept as the user made it — two corners
+    /// and what they grabbed — so a whole-column piece still reaches the last
+    /// row after rows are added.
+    struct SelectionPiece: Equatable {
+        var anchor: GridCellAddress
+        var focus: GridCellAddress
+        var span: SelectionSpan
+    }
+
+    /// Earlier pieces kept by ⌘-click, for picking cells that aren't next to
+    /// each other. The ACTIVE piece — the one shift-click and the arrow keys
+    /// act on — is still anchor / focus / span, so everything that works on a
+    /// single rectangle keeps working on the one the user is shaping.
+    private(set) var extraPieces: [SelectionPiece] = []
+
     // MARK: Selection
 
-    /// The current selection as a rectangle in display coordinates.
-    var selectedRange: GridRange? {
-        guard let anchor, let focus, numberOfRows > 0, dataColumnCount > 0 else { return nil }
+    private func resolve(anchor: GridCellAddress, focus: GridCellAddress,
+                         span: SelectionSpan) -> GridRange? {
+        guard numberOfRows > 0, dataColumnCount > 0 else { return nil }
         switch span {
         case .cells:
             return GridRange(anchorRow: anchor.row, anchorColumn: anchor.column,
@@ -171,16 +214,51 @@ final class CopyableTableView: NSTableView {
         }
     }
 
-    /// Columns wholly covered by the selection — what the column operations act on.
-    var fullySelectedColumns: IndexSet {
-        guard let range = selectedRange else { return [] }
-        guard span == .wholeColumns || range.rowCount >= numberOfRows else { return [] }
-        return IndexSet(range.leftColumn...range.rightColumn)
+    /// The ACTIVE rectangle in display coordinates — what every single-range
+    /// operation (paste, move rows, insert column) acts on.
+    var selectedRange: GridRange? {
+        guard let anchor, let focus else { return nil }
+        return resolve(anchor: anchor, focus: focus, span: span)
     }
 
+    /// Every rectangle selected, ⌘-clicked pieces first and the active one last.
+    var selectedRanges: [GridRange] {
+        extraPieces.compactMap { resolve(anchor: $0.anchor, focus: $0.focus, span: $0.span) }
+            + (selectedRange.map { [$0] } ?? [])
+    }
+
+    var hasMultipleRanges: Bool { !extraPieces.isEmpty && selectedRange != nil }
+
+    func isCellSelected(row: Int, column: Int) -> Bool {
+        selectedRanges.contains { $0.contains(row: row, column: column) }
+    }
+
+    /// Every column any piece touches, left to right — what Join acts on.
+    var selectedColumns: [Int] {
+        Set(selectedRanges.flatMap { $0.leftColumn...$0.rightColumn }).sorted()
+    }
+
+    /// Columns wholly covered by the selection — what the column operations
+    /// act on. ⌘-clicking two headers makes both of them whole.
+    var fullySelectedColumns: IndexSet {
+        var columns = IndexSet()
+        for range in selectedRanges where range.rowCount >= numberOfRows {
+            columns.insert(integersIn: range.leftColumn...range.rightColumn)
+        }
+        return columns
+    }
+
+    /// `adding` keeps what is already selected as extra pieces (⌘-click);
+    /// otherwise the selection starts over.
     func setSelection(anchor newAnchor: GridCellAddress,
                       focus newFocus: GridCellAddress? = nil,
-                      span newSpan: SelectionSpan = .cells) {
+                      span newSpan: SelectionSpan = .cells,
+                      adding: Bool = false) {
+        if adding, let anchor, let focus {
+            extraPieces.append(SelectionPiece(anchor: anchor, focus: focus, span: span))
+        } else {
+            extraPieces = []
+        }
         anchor = newAnchor
         focus  = newFocus ?? newAnchor
         span   = newSpan
@@ -195,7 +273,28 @@ final class CopyableTableView: NSTableView {
         selectionChanged?()
     }
 
-    func selectColumn(_ column: Int, extending: Bool) {
+    /// ⌘-click on a cell: adds it as a new piece of the selection, or takes it
+    /// back out when it is already a piece on its own — how a mis-click is undone.
+    func toggleCell(_ address: GridCellAddress) {
+        let single = SelectionPiece(anchor: address, focus: address, span: .cells)
+        if let index = extraPieces.firstIndex(of: single) {
+            extraPieces.remove(at: index)
+        } else if anchor == address, focus == address, span == .cells {
+            // The active piece is this cell: step back to the previous piece,
+            // or deselect entirely when it was the only thing selected.
+            guard let previous = extraPieces.popLast() else { clearSelection(); return }
+            anchor = previous.anchor
+            focus  = previous.focus
+            span   = previous.span
+        } else {
+            setSelection(anchor: address, adding: true)
+            return
+        }
+        syncRowSelection()
+        selectionChanged?()
+    }
+
+    func selectColumn(_ column: Int, extending: Bool, adding: Bool = false) {
         // Selecting from the header bypasses this view's mouseDown entirely,
         // so focus has to be claimed here as well or ⌘C would do nothing.
         window?.makeFirstResponder(self)
@@ -205,18 +304,18 @@ final class CopyableTableView: NSTableView {
             syncRowSelection()
             selectionChanged?()
         } else {
-            setSelection(anchor: address, focus: address, span: .wholeColumns)
+            setSelection(anchor: address, focus: address, span: .wholeColumns, adding: adding)
         }
     }
 
-    func selectRow(_ row: Int, extending: Bool) {
+    func selectRow(_ row: Int, extending: Bool, adding: Bool = false) {
         let address = GridCellAddress(row: row, column: 0)
         if extending, anchor != nil, span == .wholeRows {
             focus = address
             syncRowSelection()
             selectionChanged?()
         } else {
-            setSelection(anchor: address, focus: address, span: .wholeRows)
+            setSelection(anchor: address, focus: address, span: .wholeRows, adding: adding)
         }
     }
 
@@ -224,16 +323,20 @@ final class CopyableTableView: NSTableView {
         anchor = nil
         focus  = nil
         span   = .cells
+        extraPieces = []
         deselectAll(nil)
         selectionChanged?()
     }
 
-    /// Mirrors the rectangle onto AppKit's row selection. The highlight is off,
+    /// Mirrors the selection onto AppKit's row selection. The highlight is off,
     /// so this is invisible — it exists so the row operations that already read
-    /// `selectedRowIndexes` keep seeing what the user selected.
+    /// `selectedRowIndexes` keep seeing what the user selected, every piece of it:
+    /// ⌘-clicking rows 2 and 5 and choosing Delete Rows deletes both.
     private func syncRowSelection() {
-        guard let range = selectedRange else { deselectAll(nil); return }
-        let rows = IndexSet(integersIn: range.topRow...range.bottomRow)
+        let ranges = selectedRanges
+        guard !ranges.isEmpty else { deselectAll(nil); return }
+        var rows = IndexSet()
+        for range in ranges { rows.insert(integersIn: range.topRow...range.bottomRow) }
         selectRowIndexes(rows, byExtendingSelection: false)
     }
 
@@ -256,9 +359,87 @@ final class CopyableTableView: NSTableView {
         return tableColumns[index].identifier.rawValue == "col_rownum"
     }
 
+    // MARK: Row dragging
+    //
+    // Rows move the way they do in a spreadsheet: select them in the # gutter,
+    // then press on the selection and drag. Pressing on rows that are already
+    // selected is ambiguous until the mouse moves — it may be a drag or just a
+    // click to select one row — so the press is parked in `pendingRowDrag` and
+    // resolved by whichever comes first, a drag past a few points or a mouseUp.
+    //
+    // The drop itself is NSTableView's own machinery (validateDrop / acceptDrop
+    // in the coordinator), which draws the insertion line and autoscrolls.
+
+    private var pendingRowDrag: (row: Int, origin: NSPoint)?
+    private lazy var rowDragSource = RowDragSource(table: self)
+
+    /// Whether a gutter press at `row` lands on a whole-row selection.
+    private func isOnSelectedRows(_ row: Int) -> Bool {
+        // Rows move as one block; a ⌘-clicked selection of scattered rows can't.
+        guard span == .wholeRows, extraPieces.isEmpty, let range = selectedRange else { return false }
+        return row >= range.topRow && row <= range.bottomRow
+    }
+
+    private func beginRowDrag(with event: NSEvent) {
+        guard let range = selectedRange else { return }
+        guard rowMoveAllowed?() ?? false else { rowMoveRefused?(); return }
+
+        let rowsRect = rect(ofRow: range.topRow).union(rect(ofRow: range.bottomRow))
+        let visible = rowsRect.intersection(visibleRect)
+        guard !visible.isEmpty else { return }
+
+        let item = NSPasteboardItem()
+        item.setString("\(range.topRow)-\(range.bottomRow)", forType: .notepadGridRows)
+        let dragItem = NSDraggingItem(pasteboardWriter: item)
+        dragItem.setDraggingFrame(visible, contents: snapshot(of: visible))
+        let session = beginDraggingSession(with: [dragItem], event: event, source: rowDragSource)
+        session.animatesToStartingPositionsOnCancelOrFail = true
+    }
+
+    /// A picture of the rows being dragged, selection tint and all.
+    private func snapshot(of rect: NSRect) -> NSImage {
+        guard let rep = bitmapImageRepForCachingDisplay(in: rect) else { return NSImage(size: rect.size) }
+        cacheDisplay(in: rect, to: rep)
+        let image = NSImage(size: rect.size)
+        image.addRepresentation(rep)
+        return image
+    }
+
+    // An open hand over selected rows in the gutter says "these can be dragged".
+    private var gutterTrackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let gutterTrackingArea { removeTrackingArea(gutterTrackingArea) }
+        let area = NSTrackingArea(rect: .zero,
+                                  options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        gutterTrackingArea = area
+    }
+
+    private var showingGrabCursor = false
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        let point = convert(event.locationInWindow, from: nil)
+        let grabbable = isOverRowNumberColumn(point) && isOnSelectedRows(row(at: point))
+        if grabbable { NSCursor.openHand.set() } else if showingGrabCursor { NSCursor.arrow.set() }
+        showingGrabCursor = grabbable
+    }
+
     // MARK: Mouse
 
     override func mouseDown(with event: NSEvent) {
+        // Ctrl-click is the Mac's right-click. This override used to treat it as
+        // a plain click, which threw the selection away instead of showing the
+        // menu for it — the worst outcome for anyone with a Windows habit of
+        // Ctrl-clicking to add cells.
+        if event.modifierFlags.contains(.control) {
+            if let menu = menu(for: event) { NSMenu.popUpContextMenu(menu, with: event, for: self) }
+            return
+        }
+
         let point = convert(event.locationInWindow, from: nil)
         let clickedRow = row(at: point)
         guard clickedRow >= 0 else { super.mouseDown(with: event); return }
@@ -271,7 +452,13 @@ final class CopyableTableView: NSTableView {
 
         // The row-number column selects the whole row, like a spreadsheet gutter.
         if isOverRowNumberColumn(point) {
-            selectRow(clickedRow, extending: event.modifierFlags.contains(.shift))
+            let modifiers = event.modifierFlags.intersection([.shift, .command, .option, .control])
+            if modifiers.isEmpty, isOnSelectedRows(clickedRow) {
+                pendingRowDrag = (clickedRow, event.locationInWindow)
+                return
+            }
+            selectRow(clickedRow, extending: event.modifierFlags.contains(.shift),
+                      adding: event.modifierFlags.contains(.command))
             return
         }
 
@@ -279,14 +466,26 @@ final class CopyableTableView: NSTableView {
             super.mouseDown(with: event); return
         }
 
+        let address = GridCellAddress(row: clickedRow, column: clickedColumn)
+
+        // ⌘-click picks cells that aren't next to each other — the Mac's
+        // version of Ctrl-click in Windows spreadsheets (Ctrl-click here is a
+        // right-click). Dragging on from here adds a whole range.
+        if event.modifierFlags.contains(.command) {
+            toggleCell(address)
+            return
+        }
+
         // Double-click opens the cell for editing. Single click only selects —
         // dragging out a range is impossible if the first click starts an edit.
-        if event.clickCount >= 2 {
+        // Only a second click on the SAME cell counts, and never with shift: a
+        // quick click-then-shift-click across the grid can arrive with a click
+        // count of 2, and it means "select this range", not "edit that cell".
+        if event.clickCount >= 2, !event.modifierFlags.contains(.shift), anchor == address {
             beginEditRequested?(clickedRow, clickedColumn)
             return
         }
 
-        let address = GridCellAddress(row: clickedRow, column: clickedColumn)
         if event.modifierFlags.contains(.shift) {
             extendSelection(to: address)
         } else {
@@ -296,7 +495,27 @@ final class CopyableTableView: NSTableView {
         // tracking and we would stop receiving mouseDragged for the rubber band.
     }
 
+    override func mouseUp(with event: NSEvent) {
+        if let pending = pendingRowDrag {
+            // Pressed on the selected rows and let go without moving: a plain
+            // click, which selects just that row like any other gutter click.
+            pendingRowDrag = nil
+            selectRow(pending.row, extending: false)
+            return
+        }
+        super.mouseUp(with: event)
+    }
+
     override func mouseDragged(with event: NSEvent) {
+        if let pending = pendingRowDrag {
+            let dx = event.locationInWindow.x - pending.origin.x
+            let dy = event.locationInWindow.y - pending.origin.y
+            guard dx * dx + dy * dy >= 16 else { return }
+            pendingRowDrag = nil
+            beginRowDrag(with: event)
+            return
+        }
+
         let point = convert(event.locationInWindow, from: nil)
         let dragRow = row(at: point)
         guard dragRow >= 0 else { return }
@@ -322,6 +541,12 @@ final class CopyableTableView: NSTableView {
         let extending = event.modifierFlags.contains(.shift)
 
         if event.modifierFlags.contains(.command) {
+            // ⌥⌘↑ / ⌥⌘↓ move the selected rows. Normally the Table menu's key
+            // equivalent catches these first; this is the path when it can't.
+            if event.modifierFlags.contains(.option), event.keyCode == 125 || event.keyCode == 126 {
+                moveRowsHandler?(event.keyCode == 126 ? -1 : 1)
+                return
+            }
             // ⌘ + arrow jumps to the edge of the grid, the way a spreadsheet does.
             switch event.keyCode {
             case 123: jumpToEdge(rowDelta: 0,  columnDelta: -1, extending: extending); return
@@ -441,21 +666,39 @@ final class CopyableTableView: NSTableView {
         case #selector(paste(_:)): return pasteHandler != nil
         case #selector(selectAll(_:)):
             return numberOfRows > 0 && dataColumnCount > 0
-        case #selector(fillDownAction(_:)):
-            // Needs at least two rows selected: with one there is nothing to fill into.
-            return (selectedRange?.rowCount ?? 0) > 1
+        case #selector(fillDownAction(_:)), #selector(fillSeriesAction(_:)):
+            // Needs a piece at least two rows tall: with one row there is
+            // nothing to fill into. Each piece fills on its own.
+            return selectedRanges.contains { $0.rowCount > 1 }
         case #selector(fillRightAction(_:)):
-            return (selectedRange?.columnCount ?? 0) > 1
+            return selectedRanges.contains { $0.columnCount > 1 }
         case #selector(insertColumnBeforeAction(_:)),
              #selector(insertColumnAfterAction(_:)),
              #selector(renameColumnAction(_:)):
-            return selectedRange != nil
+            // "Before the selection" means nothing when it is in several places.
+            return selectedRange != nil && !hasMultipleRanges
         case #selector(deleteColumnsAction(_:)):
             return !fullySelectedColumns.isEmpty
         case #selector(duplicateRowsAction(_:)), #selector(deleteRowsAction(_:)):
             return !selectedRowIndexes.isEmpty
         case #selector(insertRowAction(_:)):
             return true
+        case #selector(joinColumnsAction(_:)):
+            return selectedColumns.count > 1
+        case #selector(splitColumnAction(_:)):
+            return selectedColumns.count == 1
+        case #selector(splitClickedColumn(_:)), #selector(calculateFromClickedColumn(_:)),
+             #selector(calculateAction(_:)), #selector(totalsAction(_:)):
+            return dataColumnCount > 0 && numberOfRows > 0
+        case #selector(trimSpacesAction(_:)), #selector(uppercaseAction(_:)),
+             #selector(lowercaseAction(_:)), #selector(titleCaseAction(_:)):
+            return selectedRange != nil
+        case #selector(moveRowsUpAction(_:)):
+            guard let range = selectedRange, !hasMultipleRanges else { return false }
+            return range.topRow > 0 || !(rowMoveAllowed?() ?? true)
+        case #selector(moveRowsDownAction(_:)):
+            guard let range = selectedRange, !hasMultipleRanges else { return false }
+            return range.bottomRow < numberOfRows - 1 || !(rowMoveAllowed?() ?? true)
         default: return super.validateUserInterfaceItem(item)
         }
     }
@@ -469,8 +712,14 @@ final class CopyableTableView: NSTableView {
         // Right-clicking outside the selection moves it there first, so the menu
         // always acts on what the user is pointing at.
         if clickedRow >= 0, let clickedColumn = dataColumn(at: point),
-           selectedRange?.contains(row: clickedRow, column: clickedColumn) != true {
+           !isCellSelected(row: clickedRow, column: clickedColumn) {
             setSelection(anchor: GridCellAddress(row: clickedRow, column: clickedColumn))
+        }
+        // The same rule in the # gutter, which is where rows are handled from.
+        if clickedRow >= 0, isOverRowNumberColumn(point),
+           !selectedRanges.contains(where: { clickedRow >= $0.topRow && clickedRow <= $0.bottomRow
+                                             && $0.columnCount == dataColumnCount }) {
+            selectRow(clickedRow, extending: false)
         }
         return contextMenu(forColumn: dataColumn(at: point), includingRowOperations: true)
     }
@@ -487,6 +736,13 @@ final class CopyableTableView: NSTableView {
     /// "Delete Row" would be about a row the user never pointed at.
     func contextMenu(forColumn column: Int?, includingRowOperations: Bool) -> NSMenu {
         let menu = NSMenu()
+        contextColumn = column
+
+        // ── Statistics ───────────────────────────────────────────────────────
+        if let summary = summaryProvider?(), summary.cellCount > 1 {
+            addStatistics(summary, to: menu)
+            menu.addItem(.separator())
+        }
 
         if selectedRange != nil {
             addItem(to: menu, "Copy", #selector(copy(_:)))
@@ -494,6 +750,26 @@ final class CopyableTableView: NSTableView {
         }
         if NSPasteboard.general.string(forType: .string) != nil {
             addItem(to: menu, "Paste", #selector(paste(_:)))
+        }
+
+        // ── Quick actions ────────────────────────────────────────────────────
+        if selectedRange != nil || column != nil {
+            if !menu.items.isEmpty { menu.addItem(.separator()) }
+            menu.addItem(submenu("Calculate", [
+                ("New Column from Calculation…", #selector(calculateFromClickedColumn(_:))),
+                ("Add Totals Row",               #selector(totalsAction(_:))),
+                ("Fill Series",                  #selector(fillSeriesAction(_:))),
+            ]))
+            menu.addItem(submenu("Text", [
+                ("Trim Spaces", #selector(trimSpacesAction(_:))),
+                ("UPPERCASE",   #selector(uppercaseAction(_:))),
+                ("lowercase",   #selector(lowercaseAction(_:))),
+                ("Title Case",  #selector(titleCaseAction(_:))),
+                nil,
+                ("Join Columns…", #selector(joinColumnsAction(_:))),
+                ("Split Column…", column != nil ? #selector(splitClickedColumn(_:))
+                                                : #selector(splitColumnAction(_:))),
+            ]))
         }
 
         // ── Column operations ────────────────────────────────────────────────
@@ -523,6 +799,10 @@ final class CopyableTableView: NSTableView {
                 let count = selectedRowIndexes.count
                 addItem(to: menu, count == 1 ? "Duplicate Row" : "Duplicate \(count) Rows",
                         #selector(duplicateRows(_:)))
+                addItem(to: menu, count == 1 ? "Move Row Up" : "Move Rows Up",
+                        #selector(moveRowsUpAction(_:)), arrow: NSUpArrowFunctionKey)
+                addItem(to: menu, count == 1 ? "Move Row Down" : "Move Rows Down",
+                        #selector(moveRowsDownAction(_:)), arrow: NSDownArrowFunctionKey)
                 menu.addItem(.separator())
                 addItem(to: menu, count == 1 ? "Delete Row" : "Delete \(count) Rows",
                         #selector(deleteRows(_:)))
@@ -536,10 +816,80 @@ final class CopyableTableView: NSTableView {
     /// rather than on the keyboard focus, which may be elsewhere.
     private var menuColumn: Int = 0
 
-    private func addItem(to menu: NSMenu, _ title: String, _ action: Selector) {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+    /// The same, but nil over the # gutter, for the quick actions that fall
+    /// back to the selection when no column was pointed at.
+    private var contextColumn: Int?
+
+    /// `arrow` shows ⌥⌘ plus that arrow beside the item, matching the Table
+    /// menu. In a context menu it is a label only; the Table menu owns the key.
+    private func addItem(to menu: NSMenu, _ title: String, _ action: Selector, arrow: Int? = nil) {
+        let key = arrow.flatMap(UnicodeScalar.init).map { String(Character($0)) } ?? ""
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        if arrow != nil { item.keyEquivalentModifierMask = [.command, .option] }
         item.target = self
         menu.addItem(item)
+    }
+
+    /// A submenu of items targeting this table; nil entries become separators.
+    private func submenu(_ title: String, _ entries: [(String, Selector)?]) -> NSMenuItem {
+        let submenu = NSMenu(title: title)
+        for entry in entries {
+            if let (itemTitle, action) = entry {
+                addItem(to: submenu, itemTitle, action)
+            } else {
+                submenu.addItem(.separator())
+            }
+        }
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.submenu = submenu
+        return item
+    }
+
+    /// Sum, average, count, min and max of the selection, values lined up on
+    /// the right. Choosing one copies its exact value as a plain number. A
+    /// selection with no numbers in it shows only how many cells are filled.
+    private func addStatistics(_ summary: SelectionSummary, to menu: NSMenu) {
+        menu.addItem(.sectionHeader(title: "Selection — click to copy"))
+
+        var rows: [(name: String, shown: String, copied: String)] = []
+        func add(_ name: String, _ value: Double, isAverage: Bool = false) {
+            rows.append((name,
+                         summary.formatted(value, isAverage: isAverage, grouped: true),
+                         summary.formatted(value, isAverage: isAverage, grouped: false)))
+        }
+        if summary.hasNumbers { add("Sum", summary.sum) }
+        if let average = summary.average { add("Average", average, isAverage: true) }
+        rows.append(("Count", "\(summary.filledCount)", "\(summary.filledCount)"))
+        if let minimum = summary.minimum, let maximum = summary.maximum {
+            add("Min", minimum)
+            add("Max", maximum)
+        }
+
+        let font   = NSFont.menuFont(ofSize: 0)
+        let digits = NSFont.monospacedDigitSystemFont(ofSize: font.pointSize, weight: .regular)
+        let nameWidth  = rows.map { ($0.name as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+        let valueWidth = rows.map { ($0.shown as NSString).size(withAttributes: [.font: digits]).width }.max() ?? 0
+        let style = NSMutableParagraphStyle()
+        style.tabStops = [NSTextTab(textAlignment: .right, location: ceil(nameWidth + 40 + valueWidth))]
+
+        for row in rows {
+            let title = NSMutableAttributedString(string: row.name + "\t",
+                                                  attributes: [.font: font, .paragraphStyle: style])
+            title.append(NSAttributedString(string: row.shown,
+                                            attributes: [.font: digits, .paragraphStyle: style]))
+            let item = NSMenuItem(title: "\(row.name) \(row.shown)",
+                                  action: #selector(copyStatistic(_:)), keyEquivalent: "")
+            item.attributedTitle = title
+            item.representedObject = [row.copied, row.name]
+            item.toolTip = "Copy \(row.copied)"
+            item.target = self
+            menu.addItem(item)
+        }
+    }
+
+    @objc private func copyStatistic(_ sender: NSMenuItem) {
+        guard let parts = sender.representedObject as? [String], parts.count == 2 else { return }
+        copyStatisticHandler?(parts[0], parts[1])
     }
 
     // MARK: Menu-bar actions
@@ -582,11 +932,52 @@ final class CopyableTableView: NSTableView {
     @objc private func insertRow(_ sender: Any?)     { insertHandler?() }
     @objc private func duplicateRows(_ sender: Any?) { duplicateHandler?() }
 
+    // Quick actions — shared by the Table menu and the context menu.
+    @objc func fillSeriesAction(_ sender: Any?)   { fillSeriesHandler?() }
+    @objc func calculateAction(_ sender: Any?)    { calculateHandler?(nil) }
+    @objc func totalsAction(_ sender: Any?)       { totalsHandler?() }
+    @objc func trimSpacesAction(_ sender: Any?)   { transformHandler?(.trimSpaces) }
+    @objc func uppercaseAction(_ sender: Any?)    { transformHandler?(.uppercase) }
+    @objc func lowercaseAction(_ sender: Any?)    { transformHandler?(.lowercase) }
+    @objc func titleCaseAction(_ sender: Any?)    { transformHandler?(.titleCase) }
+    @objc func joinColumnsAction(_ sender: Any?)  { joinColumnsHandler?() }
+    @objc func splitColumnAction(_ sender: Any?)  { splitColumnHandler?(nil) }
+    @objc func moveRowsUpAction(_ sender: Any?)   { moveRowsHandler?(-1) }
+    @objc func moveRowsDownAction(_ sender: Any?) { moveRowsHandler?(1) }
+    @objc func keepSortAction(_ sender: Any?)     { keepSortHandler?() }
+
+    @objc private func calculateFromClickedColumn(_ sender: Any?) { calculateHandler?(contextColumn) }
+    @objc private func splitClickedColumn(_ sender: Any?)         { splitColumnHandler?(contextColumn) }
+
     @objc private func insertColumnLeft(_ sender: Any?)  { insertColumnHandler?(menuColumn) }
     @objc private func insertColumnRight(_ sender: Any?) { insertColumnHandler?(menuColumn + 1) }
     @objc private func deleteColumns(_ sender: Any?)     { deleteColumnHandler?() }
     @objc private func renameColumn(_ sender: Any?)      { renameColumnHandler?(menuColumn) }
     @objc private func sortByColumn(_ sender: Any?)      { sortColumnHandler?(menuColumn) }
+}
+
+// MARK: - Row drag source
+
+extension NSPasteboard.PasteboardType {
+    /// Private to this app, so a dragged row can't be dropped as text somewhere
+    /// it would read as a paste — the only thing that accepts it is a grid.
+    static let notepadGridRows = NSPasteboard.PasteboardType("com.josephsea.notepad.grid-rows")
+}
+
+/// Source for a row drag. Kept separate from the table rather than leaning on
+/// NSTableView's own source methods, which expect a drag the table started
+/// itself through super.mouseDown — a path the grid deliberately never takes.
+final class RowDragSource: NSObject, NSDraggingSource {
+    weak var table: CopyableTableView?
+
+    init(table: CopyableTableView) {
+        self.table = table
+    }
+
+    func draggingSession(_ session: NSDraggingSession,
+                         sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        context == .withinApplication ? .move : []
+    }
 }
 
 // MARK: - Find match coordinate
@@ -640,6 +1031,22 @@ struct CSVTableView: NSViewRepresentable {
         dataTable.fillDownHandler  = { [weak coord] in coord?.fillDown() }
         dataTable.fillRightHandler = { [weak coord] in coord?.fillRight() }
         dataTable.clearSortHandler = { [weak coord] in coord?.clearSort() }
+
+        dataTable.fillSeriesHandler  = { [weak coord] in coord?.fillSeries() }
+        dataTable.calculateHandler   = { [weak coord] column in coord?.addCalculatedColumn(from: column) }
+        dataTable.totalsHandler      = { [weak coord] in coord?.addTotalsRow() }
+        dataTable.transformHandler   = { [weak coord] transform in coord?.transformSelection(transform) }
+        dataTable.joinColumnsHandler = { [weak coord] in coord?.joinSelectedColumns() }
+        dataTable.splitColumnHandler = { [weak coord] column in coord?.splitColumn(column) }
+        dataTable.moveRowsHandler    = { [weak coord] delta in coord?.moveSelectedRows(by: delta) }
+        dataTable.keepSortHandler    = { [weak coord] in coord?.keepSortedOrder() }
+        dataTable.rowMoveAllowed     = { [weak coord] in coord?.document?.csvSortKeys.isEmpty ?? false }
+        dataTable.rowMoveRefused     = { [weak coord] in coord?.explainSortedMove() }
+        dataTable.summaryProvider    = { [weak coord] in coord?.selectionSummary() }
+        dataTable.copyStatisticHandler = { [weak coord] value, name in
+            coord?.document?.copyStatistic(value, named: name)
+        }
+        dataTable.registerForDraggedTypes([.notepadGridRows])
 
         dataTable.selectionChanged    = { [weak coord] in coord?.selectionDidChange() }
         dataTable.beginEditRequested  = { [weak coord] row, column in
@@ -737,6 +1144,17 @@ struct CSVTableView: NSViewRepresentable {
         // MARK: Display order (sort)
 
         func rebuildDisplayOrder(in doc: NotepadDocument) {
+            let previous = displayOrder
+            computeDisplayOrder(in: doc)
+            // A new order means the same display rows now hold different csvRows.
+            // Deferred because this also runs inside the observation closure,
+            // where writing observed document state would re-trigger it.
+            if displayOrder != previous {
+                DispatchQueue.main.async { [weak self] in self?.publishSelection() }
+            }
+        }
+
+        private func computeDisplayOrder(in doc: NotepadDocument) {
             let offset = doc.csvShowHeaders ? 1 : 0
             let total  = doc.csvRows.count
             guard total > offset else { displayOrder = []; return }
@@ -1131,16 +1549,14 @@ struct CSVTableView: NSViewRepresentable {
 
         // MARK: Selection → clipboard
 
-        /// The selected block, or nil when nothing is selected.
-        private func selectedCells() -> [[String]]? {
-            guard let dt = tableView, let doc = document,
-                  let range = dt.selectedRange else { return nil }
-            let cells = gridCells(from: doc.csvRows, range: range, displayOrder: displayOrder)
-            return cells.isEmpty ? nil : cells
-        }
-
-        func copySelection() {
-            guard let cells = selectedCells() else { return }
+        /// Copies the selection as TSV. Returns false when there was nothing to copy.
+        @discardableResult
+        func copySelection() -> Bool {
+            guard let dt = tableView, let doc = document else { return false }
+            guard let copied = combinedCells(from: doc.csvRows, ranges: dt.selectedRanges,
+                                             displayOrder: displayOrder),
+                  !copied.grid.isEmpty else { return false }
+            let cells = copied.grid
             // Always TSV regardless of the file's own delimiter — Google Sheets
             // and every other spreadsheet split pasted text on tabs, not commas.
             // The file's real format lives in doc.text and is untouched by this.
@@ -1148,21 +1564,30 @@ struct CSVTableView: NSViewRepresentable {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(serializeDelimited(rows, delimiter: "\t"),
                                            forType: .string)
+            // Say so when the gaps between the pieces were closed up, so a paste
+            // that comes out more compact than the selection isn't a surprise.
+            if copied.closedGaps {
+                let count = cells.reduce(0) { $0 + $1.count }
+                doc.showStatusNotice("Copied \(count) cells, gaps left out", symbol: "list.bullet")
+            }
+            return true
         }
 
         func cutSelection() {
-            guard selectedCells() != nil else { return }
-            copySelection()
+            // Only clear what actually reached the clipboard.
+            guard copySelection() else { return }
             clearSelectedCells(actionName: "Cut")
         }
 
-        /// Blanks the selected cells without moving anything around them.
+        /// Blanks every selected cell, in every piece, without moving anything
+        /// around them.
         func clearSelectedCells(actionName: String = "Clear Cells") {
-            guard let dt = tableView, let doc = document,
-                  let range = dt.selectedRange else { return }
+            guard let dt = tableView, let doc = document else { return }
+            let ranges = dt.selectedRanges
+            guard !ranges.isEmpty else { return }
             let order = displayOrder
             doc.mutateCSV(actionName: actionName) { rows in
-                clearCells(in: &rows, range: range, displayOrder: order)
+                for range in ranges { clearCells(in: &rows, range: range, displayOrder: order) }
             }
             dt.reloadData()
         }
@@ -1205,22 +1630,37 @@ struct CSVTableView: NSViewRepresentable {
 
         // MARK: Fill
 
-        func fillDown() {
-            guard let dt = tableView, let doc = document,
-                  let range = dt.selectedRange, range.rowCount > 1 else { return }
+        /// ⌘D. Continues a pattern when the top two cells make one (1, 2 ·
+        /// Mon, Tue · Item 1, Item 2) and copies the top cell down otherwise.
+        func fillDown()   { fill(mode: .continuePatternOrCopy, actionName: "Fill Down") }
+
+        /// Always counts: one seed steps by 1, an empty column numbers from 1.
+        func fillSeries() { fill(mode: .series, actionName: "Fill Series") }
+
+        /// Each selected piece fills from its own top cells, the way a
+        /// spreadsheet fills a ⌘-clicked selection one range at a time.
+        private func fill(mode: FillMode, actionName: String) {
+            guard let dt = tableView, let doc = document else { return }
+            let ranges = dt.selectedRanges.filter { $0.rowCount > 1 }
+            guard !ranges.isEmpty else { return }
             let order = displayOrder
-            doc.mutateCSV(actionName: "Fill Down") { rows in
-                Notepad.fillDown(in: &rows, range: range, displayOrder: order)
+            doc.mutateCSV(actionName: actionName) { rows in
+                for range in ranges {
+                    Notepad.fillSeries(in: &rows, range: range, displayOrder: order, mode: mode)
+                }
             }
             dt.reloadData()
         }
 
         func fillRight() {
-            guard let dt = tableView, let doc = document,
-                  let range = dt.selectedRange, range.columnCount > 1 else { return }
+            guard let dt = tableView, let doc = document else { return }
+            let ranges = dt.selectedRanges.filter { $0.columnCount > 1 }
+            guard !ranges.isEmpty else { return }
             let order = displayOrder
             doc.mutateCSV(actionName: "Fill Right") { rows in
-                Notepad.fillRight(in: &rows, range: range, displayOrder: order)
+                for range in ranges {
+                    Notepad.fillRight(in: &rows, range: range, displayOrder: order)
+                }
             }
             dt.reloadData()
         }
@@ -1240,6 +1680,7 @@ struct CSVTableView: NSViewRepresentable {
             doc.mutateCSV(actionName: "Insert Column") { rows in
                 Notepad.insertColumn(in: &rows, at: index)
             }
+            shiftSortKeys(insertedAt: index, count: 1)
             rebuildDisplayOrder(in: doc)
             rebuildColumns()
             dt.setSelection(anchor: GridCellAddress(row: 0, column: index),
@@ -1254,6 +1695,11 @@ struct CSVTableView: NSViewRepresentable {
             let label = columns.count == 1 ? "Delete Column" : "Delete Columns"
             doc.mutateCSV(actionName: label) { rows in
                 deleteColumns(in: &rows, at: columns)
+            }
+            // A sort on a deleted column goes with it; the rest shift left.
+            doc.csvSortKeys = doc.csvSortKeys.compactMap { key in
+                Self.columnAfterDelete(key.column, deleted: columns)
+                    .map { CSVSortKey(column: $0, ascending: key.ascending) }
             }
             dt.clearSelection()
             rebuildDisplayOrder(in: doc)
@@ -1295,30 +1741,330 @@ struct CSVTableView: NSViewRepresentable {
             rebuildColumns()
         }
 
+        // MARK: Sort keys across column changes
+        //
+        // Sort keys address columns by index. An insert or delete that doesn't
+        // carry them along leaves the grid sorted by whatever slid into that
+        // slot — the same trap the column move already handles with remapColumn.
+
+        private func shiftSortKeys(insertedAt index: Int, count: Int) {
+            guard let doc = document, !doc.csvSortKeys.isEmpty else { return }
+            doc.csvSortKeys = doc.csvSortKeys.map {
+                CSVSortKey(column: Self.columnAfterInsert($0.column, at: index, count: count),
+                           ascending: $0.ascending)
+            }
+        }
+
+        static func columnAfterInsert(_ column: Int, at index: Int, count: Int) -> Int {
+            column >= index ? column + count : column
+        }
+
+        /// Where a column lands after `deleted` are removed, or nil if it was one of them.
+        static func columnAfterDelete(_ column: Int, deleted: IndexSet) -> Int? {
+            deleted.contains(column) ? nil : column - deleted.count(in: 0..<column)
+        }
+
+        // MARK: Statistics
+
+        /// The selection's numbers for the context menu. Capped like the status
+        /// bar's, so a whole column of a huge file can't stall the menu.
+        func selectionSummary() -> SelectionSummary? {
+            guard let dt = tableView, let doc = document else { return nil }
+            let ranges = dt.selectedRanges
+            guard !ranges.isEmpty,
+                  ranges.reduce(0, { $0 + $1.rowCount * $1.columnCount }) <= 200_000 else { return nil }
+            let blocks = selectionBlocks(for: ranges, displayOrder: displayOrder)
+            return summarize([selectedCellValues(in: doc.csvRows, blocks: blocks)])
+        }
+
+        // MARK: Quick actions
+
+        /// 1 when the first row is showing as headers, 0 when it is data.
+        private var headerRows: Int { document?.csvShowHeaders == true ? 1 : 0 }
+
+        /// What each data column is called on screen: its header, or its letter.
+        private func dataColumnTitles() -> [String] {
+            guard let dt = tableView else { return [] }
+            return (0..<dt.dataColumnCount).map { index in
+                dt.tableColumns.first { $0.identifier.rawValue == "col_\(index)" }?.title
+                    ?? columnLetter(index)
+            }
+        }
+
+        /// Leaves the columns a quick action just made selected and in view.
+        private func selectColumns(_ columns: ClosedRange<Int>) {
+            guard let dt = tableView else { return }
+            dt.setSelection(anchor: GridCellAddress(row: 0, column: columns.lowerBound),
+                            focus: GridCellAddress(row: 0, column: columns.upperBound),
+                            span: .wholeColumns)
+            if let index = dt.tableColumns.firstIndex(where: {
+                $0.identifier.rawValue == "col_\(columns.upperBound)"
+            }) { dt.scrollColumnToVisible(index) }
+        }
+
+        func addCalculatedColumn(from column: Int?) {
+            guard let dt = tableView, let doc = document, dt.dataColumnCount > 0 else { return }
+            let columns = dataColumnTitles().enumerated().map { index, title in
+                ColumnCalculationForm.Column(
+                    title: title,
+                    isNumeric: columnAlignments.indices.contains(index)
+                        && columnAlignments[index] == .trailing)
+            }
+            let samples = displayOrder.prefix(200).enumerated().map {
+                (displayRow: $0.offset, cells: doc.csvRows[$0.element].cells)
+            }
+            guard let result = QuickActionDialogs.askCalculation(
+                columns: columns, sampleRows: samples,
+                preferredLeft: column ?? dt.selectedColumns.first ?? 0,
+                // Two columns picked (say ⌘-clicked Price and Qty): use both.
+                preferredRight: column == nil && dt.selectedColumns.count == 2
+                    ? dt.selectedColumns.last : nil) else { return }
+
+            let headerRows = headerRows
+            doc.mutateCSV(actionName: "New Column from Calculation") { rows in
+                insertCalculatedColumn(in: &rows, at: result.insertAt, title: result.title,
+                                       calculation: result.calculation, headerRows: headerRows)
+            }
+            shiftSortKeys(insertedAt: result.insertAt, count: 1)
+            rebuildDisplayOrder(in: doc)
+            rebuildColumns()
+            selectColumns(result.insertAt...result.insertAt)
+        }
+
+        func addTotalsRow() {
+            guard let dt = tableView, let doc = document else { return }
+            let headerRows = headerRows
+            let totals = totalsRow(for: doc.csvRows, headerRows: headerRows)
+            guard totals.contains(where: { !$0.isEmpty && $0 != totalsLabel }) else {
+                NSSound.beep()
+                doc.showStatusNotice("No number columns to total",
+                                     symbol: "exclamationmark.circle")
+                return
+            }
+            let replacing = doc.csvRows.count > headerRows + 1
+                && doc.csvRows.last.map(isTotalsRow) == true
+            doc.mutateCSV(actionName: replacing ? "Update Totals Row" : "Add Totals Row") { rows in
+                appendTotalsRow(to: &rows, headerRows: headerRows)
+            }
+            rebuildDisplayOrder(in: doc)
+            dt.reloadData()
+            if let row = displayOrder.firstIndex(of: doc.csvRows.count - 1) {
+                dt.selectRow(row, extending: false)
+                dt.scrollRowToVisible(row)
+            }
+        }
+
+        func transformSelection(_ transform: TextTransform) {
+            guard let dt = tableView, let doc = document else { return }
+            let ranges = dt.selectedRanges
+            guard !ranges.isEmpty else { return }
+            let order = displayOrder
+            doc.mutateCSV(actionName: transform.title) { rows in
+                // Overlapping pieces would transform a shared cell twice; every
+                // transform here gives the same answer the second time, so that
+                // is harmless and not worth deduplicating.
+                for range in ranges { transformCells(in: &rows, range: range, displayOrder: order, transform) }
+            }
+            dt.reloadData()
+        }
+
+        /// Joins every column the selection touches — neighbours, or columns
+        /// ⌘-clicked apart like First and Last with Age between them.
+        func joinSelectedColumns() {
+            guard let dt = tableView, let doc = document else { return }
+            let columns = dt.selectedColumns
+            guard columns.count > 1, let last = columns.last else { NSSound.beep(); return }
+            let titles = dataColumnTitles()
+            let names = columns.map { titles.indices.contains($0) ? titles[$0] : columnLetter($0) }
+            guard let separator = QuickActionDialogs.askSeparator(
+                title: "Join Columns",
+                message: "Joins \(names.formatted(.list(type: .and))) into a new column to "
+                    + "their right. The original columns stay as they are.",
+                button: "Join",
+                choices: QuickActionDialogs.joinSeparators) else { return }
+
+            let headerRows = headerRows
+            doc.mutateCSV(actionName: "Join Columns") { rows in
+                joinColumns(in: &rows, columns: columns, separator: separator, headerRows: headerRows)
+            }
+            shiftSortKeys(insertedAt: last + 1, count: 1)
+            rebuildDisplayOrder(in: doc)
+            rebuildColumns()
+            selectColumns((last + 1)...(last + 1))
+        }
+
+        /// Splits `requested`, or the one selected column when called from the
+        /// menu bar with no column pointed at.
+        func splitColumn(_ requested: Int?) {
+            guard let dt = tableView, let doc = document else { return }
+            let selected = dt.selectedColumns.count == 1 ? dt.selectedColumns.first : nil
+            guard let column = requested ?? selected else { NSSound.beep(); return }
+            let titles = dataColumnTitles()
+            let name = titles.indices.contains(column) ? titles[column] : columnLetter(column)
+
+            guard let separator = QuickActionDialogs.askSeparator(
+                title: "Split Column",
+                message: "Splits “\(name)” into new columns to its right. "
+                    + "The original column stays as it is.",
+                button: "Split",
+                choices: QuickActionDialogs.splitSeparators) else { return }
+
+            let headerRows = headerRows
+            let count = splitColumnCount(in: doc.csvRows, column: column,
+                                         separator: separator, headerRows: headerRows)
+            guard count > 1 else {
+                let alert = NSAlert.make()
+                alert.messageText = "Nothing to split"
+                alert.informativeText = "No cell in “\(name)” contains that separator."
+                alert.runModal()
+                return
+            }
+            // Splitting a notes column on spaces can mean hundreds of columns.
+            if count > 10 {
+                let alert = NSAlert.make()
+                alert.messageText = "Split into \(count) columns?"
+                alert.informativeText = "The longest cell in “\(name)” has \(count) parts, "
+                    + "so this adds \(count) columns."
+                alert.addButton(withTitle: "Split")
+                alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
+
+            doc.mutateCSV(actionName: "Split Column") { rows in
+                Notepad.splitColumn(in: &rows, column: column, separator: separator,
+                                    headerRows: headerRows)
+            }
+            shiftSortKeys(insertedAt: column + 1, count: count)
+            rebuildDisplayOrder(in: doc)
+            rebuildColumns()
+            selectColumns((column + 1)...(column + count))
+        }
+
+        // MARK: Moving rows
+
+        /// ⌥⌘↑ / ⌥⌘↓: nudges the selected rows one place.
+        func moveSelectedRows(by delta: Int) {
+            guard let dt = tableView, let range = dt.selectedRange else { return }
+            guard !dt.hasMultipleRanges else { refuseScatteredMove(); return }
+            guard document?.csvSortKeys.isEmpty == true else { explainSortedMove(); return }
+            let gap = delta < 0 ? range.topRow - 1 : range.bottomRow + 2
+            guard gap >= 0, gap <= displayOrder.count else { NSSound.beep(); return }
+            moveSelectedRows(toGap: gap)
+        }
+
+        /// Moves the selected rows in front of display row `gap` and keeps them
+        /// selected in their new place. Shared by the drag and the keyboard.
+        @discardableResult
+        func moveSelectedRows(toGap gap: Int) -> Bool {
+            guard let dt = tableView, let doc = document, let range = dt.selectedRange else { return false }
+            guard !dt.hasMultipleRanges else { refuseScatteredMove(); return false }
+            guard doc.csvSortKeys.isEmpty else { explainSortedMove(); return false }
+            let order = displayOrder
+            var moved: ClosedRange<Int>?
+            doc.mutateCSV(actionName: range.rowCount == 1 ? "Move Row" : "Move Rows") { rows in
+                moved = moveRows(in: &rows, displayRows: range.topRow...range.bottomRow,
+                                 toGap: gap, displayOrder: order)
+            }
+            guard let moved else { return false }
+            rebuildDisplayOrder(in: doc)
+            dt.reloadData()
+            dt.setSelection(anchor: GridCellAddress(row: moved.lowerBound, column: range.leftColumn),
+                            focus: GridCellAddress(row: moved.upperBound, column: range.rightColumn),
+                            span: dt.span == .wholeRows ? .wholeRows : .cells)
+            dt.scrollRowToVisible(gap <= range.topRow ? moved.lowerBound : moved.upperBound)
+            return true
+        }
+
+        private func refuseScatteredMove() {
+            NSSound.beep()
+            document?.showStatusNotice("Only rows that are together can move",
+                                       symbol: "exclamationmark.circle")
+        }
+
+        /// A sort only changes how rows are SHOWN, so there is no order to move
+        /// a row within. Rather than silently refusing, offer the two ways out.
+        func explainSortedMove() {
+            guard let window = tableView?.window, window.attachedSheet == nil else { return }
+            let alert = NSAlert.make()
+            alert.messageText = "Rows can’t be moved while the table is sorted"
+            alert.informativeText = "Sorting only changes how the rows are shown — the file "
+                + "keeps its own order. Keep the sorted order to make it the file’s order, "
+                + "or clear the sort to go back to the file’s order."
+            alert.addButton(withTitle: "Keep Sorted Order")
+            alert.addButton(withTitle: "Clear Sort")
+            alert.addButton(withTitle: "Cancel")
+            alert.beginSheetModal(for: window) { [weak self] response in
+                switch response {
+                case .alertFirstButtonReturn:  self?.keepSortedOrder()
+                case .alertSecondButtonReturn: self?.clearSort()
+                default: break
+                }
+            }
+        }
+
+        /// Writes the sort into the file and drops the sort, so what is on screen
+        /// is now the file's real order — and what Save writes.
+        func keepSortedOrder() {
+            guard let dt = tableView, let doc = document, !doc.csvSortKeys.isEmpty else { return }
+            let order = displayOrder
+            doc.mutateCSV(actionName: "Keep Sorted Order") { rows in
+                applyDisplayOrder(to: &rows, displayOrder: order)
+            }
+            doc.csvSortKeys = []
+            rebuildDisplayOrder(in: doc)
+            applySortIndicators()
+            dt.reloadData()
+        }
+
+        // MARK: Row drag and drop
+        //
+        // Only drags this grid started are accepted — the source is checked, so
+        // rows can't be dropped into another tab's table, where the selection
+        // the move reads from would belong to a different document.
+
+        func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
+                       proposedRow row: Int,
+                       proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
+            guard let dt = self.tableView,
+                  (info.draggingSource as? RowDragSource)?.table === dt,
+                  document?.csvSortKeys.isEmpty == true,
+                  let range = dt.selectedRange else { return [] }
+            tableView.setDropRow(row, dropOperation: .above)
+            // Dropping the rows where they already are would move nothing.
+            if row >= range.topRow && row <= range.bottomRow + 1 { return [] }
+            return .move
+        }
+
+        func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
+                       row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
+            guard let dt = self.tableView,
+                  (info.draggingSource as? RowDragSource)?.table === dt else { return false }
+            return moveSelectedRows(toGap: row)
+        }
+
         // MARK: Selection changes
 
         func selectionDidChange() {
+            publishSelection()
+            refreshSelectionDisplay()
+        }
+
+        /// Tells the document which csvRows the selection covers — what the
+        /// status bar totals and the Table menu enables from.
+        ///
+        /// Selection lives in DISPLAY rows, so anything that changes which csvRow
+        /// sits at a display row (a sort, Keep Sorted Order, an undo) changes what
+        /// is selected without the selection moving. Republished from
+        /// rebuildDisplayOrder for that reason: before 4.1 a sort left the status
+        /// bar totalling the rows that had been there, not the ones on screen.
+        private func publishSelection() {
             guard let dt = tableView, let doc = document else { return }
-
-            let rowCount = dt.selectedRange.map(\.rowCount) ?? 0
-            if doc.csvSelectedRowCount != rowCount { doc.csvSelectedRowCount = rowCount }
-
             // Publish only WHICH cells are selected, resolved to csvRows indices.
             // The arithmetic is derived in the status bar from the live cell
             // values, so it cannot go stale after an undo and nothing here has to
             // write a computed property back into the observed document.
-            let range = dt.selectedRange
-            let rows = range.map { r in
-                (r.topRow...r.bottomRow).compactMap {
-                    displayOrder.indices.contains($0) ? displayOrder[$0] : nil
-                }
-            } ?? []
-            let columns = range.map { $0.leftColumn...$0.rightColumn }
-
-            if doc.csvSelectionRows != rows { doc.csvSelectionRows = rows }
-            if doc.csvSelectionColumns != columns { doc.csvSelectionColumns = columns }
-
-            refreshSelectionDisplay()
+            let blocks = selectionBlocks(for: dt.selectedRanges, displayOrder: displayOrder)
+            if doc.csvSelectionBlocks != blocks { doc.csvSelectionBlocks = blocks }
         }
 
         /// Repaints the visible cells so the selection tint follows the selection.
@@ -1439,8 +2185,7 @@ struct CSVTableView: NSViewRepresentable {
                           && findMatches[currentMatchIndex] == match
             let isAny     = !isCurrent && findMatches.contains(match)
 
-            let selection   = tableView.selectedRange
-            let isSelected  = selection?.contains(row: row, column: colIdx) ?? false
+            let isSelected  = tableView.isCellSelected(row: row, column: colIdx)
             let isFocusCell = tableView.anchor == GridCellAddress(row: row, column: colIdx)
 
             if isCurrent {
@@ -1471,8 +2216,9 @@ struct CSVTableView: NSViewRepresentable {
                   tableColumn.identifier.rawValue != "col_rownum",
                   let suffix = tableColumn.identifier.rawValue.split(separator: "_").last,
                   let column = Int(suffix) else { return }
-            let extending = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
-            dt.selectColumn(column, extending: extending)
+            let modifiers = NSApp.currentEvent?.modifierFlags ?? []
+            dt.selectColumn(column, extending: modifiers.contains(.shift),
+                            adding: modifiers.contains(.command))
         }
 
         // MARK: Column reordering

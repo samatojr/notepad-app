@@ -270,9 +270,38 @@ nonisolated struct SelectionSummary: Equatable, Sendable {
     var average: Double?
     var minimum: Double?
     var maximum: Double?
+    /// The most decimal places any selected number is written with, capped.
+    /// Decides how the statistics are rounded for display and copying.
+    var decimalPlaces: Int = 0
 
     var hasNumbers: Bool { numericCount > 0 }
+
+    /// A statistic as the user sees it — and, with `grouped: false`, exactly
+    /// what clicking it copies. Same rounding either way, so the clipboard
+    /// never holds a longer number than the one that was clicked; only the
+    /// thousands separators are dropped, since "1,234" would paste as text.
+    ///
+    /// Sums, minimums and maximums keep the most decimals any selected number
+    /// has, so a money column reads as money: $1.50 + $0.75 is 2.25, and 4.60
+    /// keeps its trailing zero. An average gets at least two places, because
+    /// dividing produces decimals the inputs never had — but not the six that
+    /// "22.558333" showed in the first 4.1 build.
+    func formatted(_ value: Double, isAverage: Bool = false, grouped: Bool) -> String {
+        guard value.isFinite else { return "" }
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = grouped
+        formatter.roundingMode = .halfUp
+        formatter.minimumFractionDigits = decimalPlaces
+        formatter.maximumFractionDigits = isAverage ? max(decimalPlaces, 2) : decimalPlaces
+        // `+ 0` turns -0 into 0, so a total that cancels out never reads "-0".
+        return formatter.string(from: NSNumber(value: value + 0)) ?? ""
+    }
 }
+
+/// Decimal places past which a statistic stops gaining anything readable.
+nonisolated private let maxSummaryDecimalPlaces = 6
 
 /// Summarizes a block of cells. Numeric recognition is shared with column
 /// alignment inference, so the status bar counts exactly the cells the grid
@@ -292,6 +321,8 @@ nonisolated func summarize(_ cells: [[String]]) -> SelectionSummary {
             guard let value = numericValue(trimmed) else { continue }
             summary.numericCount += 1
             summary.sum += value
+            summary.decimalPlaces = min(maxSummaryDecimalPlaces,
+                                        max(summary.decimalPlaces, NumberStyle.fractionDigits(in: trimmed)))
             minimum = minimum.map { Swift.min($0, value) } ?? value
             maximum = maximum.map { Swift.max($0, value) } ?? value
         }
@@ -303,6 +334,105 @@ nonisolated func summarize(_ cells: [[String]]) -> SelectionSummary {
         summary.maximum = maximum
     }
     return summary
+}
+
+// MARK: - Selections of several ranges
+//
+// ⌘-click adds a range to the selection without dropping the ones already
+// there, so a selection is a LIST of rectangles. They can overlap — ⌘-dragging
+// across cells that are already selected is easy — and every operation that
+// reads cell values has to count each cell once.
+
+/// One rectangle of a selection resolved to csvRows indices, which is what the
+/// document publishes for the status bar: display rows would silently point at
+/// different cells after a re-sort.
+nonisolated struct SelectionBlock: Equatable, Sendable {
+    var rows: [Int]                  // csvRows indices, in display order
+    var columns: ClosedRange<Int>
+}
+
+nonisolated func selectionBlocks(for ranges: [GridRange], displayOrder: [Int]) -> [SelectionBlock] {
+    ranges.compactMap { range in
+        guard !range.isEmpty else { return nil }
+        let rows = (range.topRow...range.bottomRow).compactMap {
+            displayOrder.indices.contains($0) ? displayOrder[$0] : nil
+        }
+        return rows.isEmpty ? nil : SelectionBlock(rows: rows, columns: range.leftColumn...range.rightColumn)
+    }
+}
+
+/// The text of every selected cell, each cell ONCE however many blocks cover
+/// it — so two overlapping ranges don't count their shared cells twice in a sum.
+/// Cells past a short row's end are blank, as everywhere else in the grid.
+nonisolated func selectedCellValues(in rows: [CSVRow], blocks: [SelectionBlock]) -> [String] {
+    var seen = Set<[Int]>()
+    var values: [String] = []
+    for block in blocks {
+        for index in block.rows where rows.indices.contains(index) {
+            let cells = rows[index].cells
+            for column in block.columns {
+                if blocks.count > 1 {
+                    guard seen.insert([index, column]).inserted else { continue }
+                }
+                values.append(column < cells.count ? cells[column] : "")
+            }
+        }
+    }
+    return values
+}
+
+/// What a copy of several ranges puts on the clipboard.
+nonisolated struct CopiedCells: Equatable, Sendable {
+    var grid: [[String]]
+    /// True when the rows kept different columns, so the paste can't put every
+    /// cell back where it sat relative to the others — worth telling the user.
+    var closedGaps: Bool
+}
+
+/// Several ranges for the clipboard, by ONE rule: every row that has selected
+/// cells becomes one line, holding that row's selected cells left to right.
+/// Nothing unselected is copied, so nothing is invented to fill a gap.
+///
+/// Take A1, B2, C4 and D4 in a 4×4 grid. They copy as three lines — "A1",
+/// "B2", then "C4⇥D4" — so C4 and D4, which sat side by side, still do.
+///
+/// The alternatives were worse. Keeping the exact layout means copying blank
+/// cells between the picked ones, and pasting blanks wipes whatever sits there;
+/// Excel refuses such a copy outright, which tells the user nothing useful; and
+/// one cell per line split cells that shared a row. The rule also covers the
+/// shapes that line up: ranges down the same columns stack as rows, ranges
+/// across the same rows sit side by side.
+nonisolated func combinedCells(from rows: [CSVRow],
+                               ranges: [GridRange],
+                               displayOrder: [Int]) -> CopiedCells? {
+    if ranges.count == 1, let only = ranges.first {
+        // A single rectangle copies whole, blanks inside it included — the user
+        // drew that shape themselves.
+        return CopiedCells(grid: gridCells(from: rows, range: only, displayOrder: displayOrder),
+                           closedGaps: false)
+    }
+    guard !ranges.isEmpty else { return nil }
+
+    // Which columns are selected in each display row, each cell once however
+    // many ranges cover it.
+    var columnsByRow: [Int: Set<Int>] = [:]
+    for range in ranges where !range.isEmpty {
+        for row in range.topRow...range.bottomRow {
+            columnsByRow[row, default: []].formUnion(range.leftColumn...range.rightColumn)
+        }
+    }
+
+    var grid: [[String]] = []
+    var columnSets = Set<Set<Int>>()
+    for displayRow in columnsByRow.keys.sorted() {
+        guard displayOrder.indices.contains(displayRow),
+              rows.indices.contains(displayOrder[displayRow]),
+              let columns = columnsByRow[displayRow] else { continue }
+        let cells = rows[displayOrder[displayRow]].cells
+        grid.append(columns.sorted().map { $0 < cells.count ? cells[$0] : "" })
+        columnSets.insert(columns)
+    }
+    return CopiedCells(grid: grid, closedGaps: columnSets.count > 1)
 }
 
 // MARK: - Shape helpers

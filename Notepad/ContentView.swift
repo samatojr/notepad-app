@@ -34,21 +34,32 @@ final class NotepadDocument {
     var csvIsTableView:    Bool       = false // toggle between table and raw text
     var csvIsLoading:      Bool       = false // true while background parse is running
     var csvFindMatchIndex: Int        = 0     // signal for Next/Previous in table find
-    var csvShowRowNumbers: Bool       = false // show # column in table view (off by default)
+    // On by default since 4.1: the # gutter is the handle for selecting and
+    // dragging whole rows, the way every spreadsheet's row headers are.
+    var csvShowRowNumbers: Bool       = true  // show # column in table view
     var csvShowHeaders:   Bool       = true  // show column header row in table view (on by default)
     var csvSortKeys: [CSVSortKey] = []   // ordered: first = primary sort
-    var csvSelectedRowCount: Int = 0     // published by the grid for the status bar
     /// WHICH cells the grid has selected, as csvRows indices and a column range.
     /// Deliberately raw coordinates rather than a computed summary: the status
     /// bar derives the arithmetic from these against the live cell values, so it
     /// stays correct after an undo without anything writing derived state back
     /// into the document.
-    var csvSelectionRows: [Int] = []
-    var csvSelectionColumns: ClosedRange<Int>? = nil
+    /// Several blocks when cells were ⌘-clicked apart; one for a plain selection.
+    var csvSelectionBlocks: [SelectionBlock] = []
     /// Bumped whenever a grid mutation changes the table's shape (row count,
     /// column count, header text) so the table rebuilds its columns instead of
     /// merely reloading — a plain reload would keep stale titles and widths.
     var csvStructureVersion: Int = 0
+
+    /// A short confirmation the status bar shows for a moment — "Copied Sum:
+    /// 1234.5" after a statistic is clicked. A copy made from a context menu
+    /// closes the menu as it happens, so without this it confirms nothing.
+    struct StatusNotice: Equatable {
+        let text: String
+        let symbol: String
+        let id: Int
+    }
+    var statusNotice: StatusNotice?
 
     var isBeingExplicitlyClosed: Bool = false  // set true when user deliberately closes; skips session restore
 
@@ -251,8 +262,8 @@ final class NotepadDocument {
         csvIsLoading = false; csvFindMatchIndex = 0
         // Table view state is per-document too — leaving it set meant the next CSV
         // opened in this tab inherited the previous file's sorting and toggles.
-        csvSortKeys = []; csvShowRowNumbers = false; csvShowHeaders = true
-        csvSelectedRowCount = 0; csvSelectionRows = []; csvSelectionColumns = nil
+        csvSortKeys = []; csvShowRowNumbers = true; csvShowHeaders = true
+        csvSelectionBlocks = []
         fileEncoding = .utf8; lineEnding = .lf
     }
 
@@ -327,6 +338,23 @@ final class NotepadDocument {
         guard let value = Int(field.stringValue.trimmingCharacters(in: .whitespaces)),
               value >= 1 else { return }
         goToLine(value)
+    }
+
+    /// Shows `text` in the status bar for a couple of seconds.
+    func showStatusNotice(_ text: String, symbol: String = "checkmark.circle.fill") {
+        let notice = StatusNotice(text: text, symbol: symbol, id: nextRequestID())
+        statusNotice = notice
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            // Only clear our own notice — a newer one may have replaced it.
+            if self?.statusNotice == notice { self?.statusNotice = nil }
+        }
+    }
+
+    /// Puts a statistic on the clipboard as a plain number and says so.
+    func copyStatistic(_ value: String, named name: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+        showStatusNotice("Copied \(name): \(value)")
     }
 
     // MARK: Grid mutations
@@ -898,7 +926,11 @@ struct ContentView: View {
         // To remove: delete this modifier and the AppPreferences.isAmatoPadMode property.
         .accentColor(AppPreferences.shared.isAmatoPadMode ? .red : nil)
         .navigationTitle(windowTitle)
-        .focusedValue(\.notepadDocument, document)
+        // Scene-wide rather than focus-bound: the grid's NSTableView holds first
+        // responder where SwiftUI's focus system cannot see it, so a plain
+        // .focusedValue went nil in grid mode and the Table menu had no document
+        // to derive its enabled state from.
+        .focusedSceneValue(\.notepadDocument, document)
         .sheet(isPresented: $document.showWordCount) {
             WordCountView(text: document.text)
         }
@@ -1395,24 +1427,19 @@ struct StatusBarView: View {
     /// on the document means an undo that restores different values into the same
     /// cells shows the right total immediately.
     private var selectionSummary: SelectionSummary? {
-        guard let columns = document.csvSelectionColumns,
-              !document.csvSelectionRows.isEmpty else { return nil }
-        let rows = document.csvRows
+        let blocks = document.csvSelectionBlocks
+        guard !blocks.isEmpty else { return nil }
         // A whole-column selection in a very large file would make this run over
         // every row on each render. Past this point report the size only.
-        let cellCount = document.csvSelectionRows.count * columns.count
+        let cellCount = blocks.reduce(0) { $0 + $1.rows.count * $1.columns.count }
         guard cellCount <= Self.maxSummarizedCells else {
             var partial = SelectionSummary()
             partial.cellCount = cellCount
             return partial
         }
-        var cells: [[String]] = []
-        cells.reserveCapacity(document.csvSelectionRows.count)
-        for index in document.csvSelectionRows where rows.indices.contains(index) {
-            let source = rows[index].cells
-            cells.append(columns.map { $0 < source.count ? source[$0] : "" })
-        }
-        return summarize(cells)
+        // One list of values, each selected cell once — ⌘-clicked pieces that
+        // overlap must not count their shared cells twice.
+        return summarize([selectedCellValues(in: document.csvRows, blocks: blocks)])
     }
 
     private static let maxSummarizedCells = 200_000
@@ -1423,23 +1450,23 @@ struct StatusBarView: View {
                                : "Selected: \(summary.cellCount) cells"
     }
 
-    /// Sum and average of the numeric part of the selection, the way a
-    /// spreadsheet's status bar reports it.
-    private func arithmeticLabel(_ summary: SelectionSummary) -> String {
-        var parts = ["Sum: \(formatted(summary.sum))"]
-        if let average = summary.average, summary.numericCount > 1 {
-            parts.append("Avg: \(formatted(average))")
+    /// One statistic in the status bar — "Sum: 1,234.5" — that copies what it
+    /// shows when clicked, minus the thousands separators so it pastes as a
+    /// number anywhere. See SelectionSummary.formatted for the rounding.
+    ///
+    /// Formatting used to be `%g`, which showed 1,234,567.5 as "1.23457e+06" and
+    /// quietly cut 1234.567 to "1234.57" — tolerable to glance at, wrong to copy.
+    private func statisticButton(_ name: String, short: String, value: Double,
+                                 in summary: SelectionSummary, isAverage: Bool = false) -> some View {
+        Button {
+            document.copyStatistic(summary.formatted(value, isAverage: isAverage, grouped: false),
+                                   named: name)
+        } label: {
+            Text("\(short): \(summary.formatted(value, isAverage: isAverage, grouped: true))")
+                .lineLimit(1).padding(.horizontal, 8)
         }
-        return parts.joined(separator: "   ")
-    }
-
-    /// Trims the trailing ".0" off whole numbers so a column of integers reads
-    /// as integers, while keeping real decimals readable.
-    private func formatted(_ value: Double) -> String {
-        if value == value.rounded(), abs(value) < 1e15 {
-            return String(format: "%.0f", value)
-        }
-        return String(format: "%g", value)
+        .buttonStyle(.plain)
+        .help("Click to copy the \(name.lowercased())")
     }
 
     var body: some View {
@@ -1452,10 +1479,29 @@ struct StatusBarView: View {
                 if let summary = selectionSummary, summary.cellCount > 0 {
                     Divider().frame(height: 12)
                     pill(selectionLabel(summary))
-                    if summary.hasNumbers {
+                    // The confirmation takes the arithmetic's place for a moment
+                    // rather than squeezing in beside it: at ordinary window widths
+                    // there is no room for both, and every label wrapped.
+                    if let notice = document.statusNotice {
                         Divider().frame(height: 12)
-                        pill(arithmeticLabel(summary))
+                        Label(notice.text, systemImage: notice.symbol)
+                            .foregroundStyle(Color.accentColor)
+                            .lineLimit(1)
+                            .padding(.horizontal, 8)
+                    } else if summary.hasNumbers {
+                        Divider().frame(height: 12)
+                        statisticButton("Sum", short: "Sum", value: summary.sum, in: summary)
+                        if let average = summary.average, summary.numericCount > 1 {
+                            statisticButton("Average", short: "Avg", value: average,
+                                            in: summary, isAverage: true)
+                        }
                     }
+                } else if let notice = document.statusNotice {
+                    Divider().frame(height: 12)
+                    Label(notice.text, systemImage: notice.symbol)
+                        .foregroundStyle(Color.accentColor)
+                        .lineLimit(1)
+                        .padding(.horizontal, 8)
                 }
                 if !document.csvSortKeys.isEmpty {
                     Divider().frame(height: 12)
@@ -1614,7 +1660,7 @@ struct StatusBarView: View {
     }
 
     private func pill(_ label: String) -> some View {
-        Text(label).padding(.horizontal, 8)
+        Text(label).lineLimit(1).padding(.horizontal, 8)
     }
 }
 
