@@ -182,6 +182,19 @@ echo "==> Publishing to GitHub"
 TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | git credential-osxkeychain get | sed -n 's/^password=//p')
 [ -n "$TOKEN" ] || { echo "✗ No GitHub credential in Keychain; upload manually."; exit 1; }
 
+# Order matters twice over:
+#  - The appcast lives on main, so main must be pushed LAST — only once every file
+#    it points at is downloadable. Pushing it first would advertise a 404 to Sparkle.
+#  - The tag must point at the release commit. Creating the GitHub release before
+#    that commit existed on GitHub tagged whatever main was a moment earlier, so
+#    every release from 3.3 to 4.1 was tagged one release behind.
+# Pushing just the TAG sends the release commit to GitHub without moving main.
+git -C "$PROJECT_DIR" add appcast.xml Info.plist Notepad.xcodeproj/project.pbxproj Notepad/*.swift finish_release.sh
+git -C "$PROJECT_DIR" commit -F "$DIR/commit-message.txt"
+git -C "$PROJECT_DIR" tag "v${VERSION}"
+git -C "$PROJECT_DIR" push origin "refs/tags/v${VERSION}"
+echo "✓ tag v${VERSION} pushed at $(git -C "$PROJECT_DIR" rev-parse --short HEAD) (main not pushed yet)"
+
 BODY_JSON=$(python3 -c "
 import json, sys
 print(json.dumps({
@@ -194,19 +207,24 @@ REL=$(curl -sS -X POST "https://api.github.com/repos/${REPO}/releases" \
     -H "Content-Type: application/json" \
     -d "$BODY_JSON")
 UPLOAD_URL=$(echo "$REL" | python3 -c "import sys,json; print(json.load(sys.stdin).get('upload_url','').split('{')[0])")
-[ -n "$UPLOAD_URL" ] || { echo "✗ Release creation failed:"; echo "$REL" | head -20; exit 1; }
+[ -n "$UPLOAD_URL" ] || { echo "✗ Release creation failed — main NOT pushed, appcast not live:"; echo "$REL" | head -20; exit 1; }
 
-curl -sS -X POST "${UPLOAD_URL}?name=Notepad_${VERSION}.zip" \
+# --fail, and an explicit exit: a failed upload used to print nothing and carry on
+# to push the appcast anyway (set -e does not stop inside an && list).
+curl -fsS -X POST "${UPLOAD_URL}?name=Notepad_${VERSION}.zip" \
     -H "Authorization: token ${TOKEN}" \
     -H "Content-Type: application/octet-stream" \
-    --data-binary @"$ZIP" >/dev/null && echo "✓ zip uploaded (Sparkle auto-update)"
+    --data-binary @"$ZIP" >/dev/null \
+    || { echo "✗ zip upload failed — main NOT pushed, appcast not live"; exit 1; }
+echo "✓ zip uploaded (Sparkle auto-update)"
 
-curl -sS -X POST "${UPLOAD_URL}?name=Notepad_${VERSION}.dmg" \
+curl -fsS -X POST "${UPLOAD_URL}?name=Notepad_${VERSION}.dmg" \
     -H "Authorization: token ${TOKEN}" \
     -H "Content-Type: application/x-apple-diskimage" \
-    --data-binary @"$DMG" >/dev/null && echo "✓ dmg uploaded (manual install)"
+    --data-binary @"$DMG" >/dev/null \
+    || { echo "✗ dmg upload failed — main NOT pushed, appcast not live"; exit 1; }
+echo "✓ dmg uploaded (manual install)"
 
-git -C "$PROJECT_DIR" add appcast.xml Info.plist Notepad.xcodeproj/project.pbxproj Notepad/*.swift finish_release.sh
-git -C "$PROJECT_DIR" commit -F "$DIR/commit-message.txt"
+# Last: this is the moment clients can see the update.
 git -C "$PROJECT_DIR" push origin main
 echo "✓ published — clients will pick up ${VERSION} on their next update check"
