@@ -16,8 +16,8 @@
 
 set -euo pipefail
 
-VERSION="4.0.2"
-BUILD="33"
+VERSION="4.1"
+BUILD="34"
 REPO="samatojr/notepad-app"
 DIR="/tmp/np-release"
 APP="$DIR/Notepad.app"
@@ -119,12 +119,13 @@ ITEM="        <item>
             <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>
             <description><![CDATA[
                 <ul>
-                    <li>Close Notepad with several tabs open and they all come back where you left them — including the window arrangement. Two windows of two tabs used to return as one window of four.</li>
-                    <li>Scratch tabs no longer ask to be saved. Closing or quitting with four untitled tabs open asked four times; now it asks nothing and simply brings them back. Named files still ask, because their changes affect a real file on disk.</li>
-                    <li>Your tabs now survive a crash or a force-quit, not just a tidy quit. The session is saved every few seconds instead of only on the way out.</li>
-                    <li>After an unexpected quit, Notepad no longer reopens a pile of empty windows.</li>
-                    <li>⌘T reliably opens a tab. It sometimes opened a separate window instead.</li>
-                    <li>Scratch tabs you haven't touched for a couple of sessions stop reopening on their own — they move to File ▸ Reopen Closed Tab (⇧⌘T) rather than being discarded. Saved files are never aged out.</li>
+                    <li>Right-click a selection to see its Sum, Average, Count, Min and Max — click one to copy it. The Sum and Avg in the status bar copy when clicked, too.</li>
+                    <li>⌘-click to pick cells that aren’t next to each other. Totals, copy, clear and the text actions work across all of them.</li>
+                    <li>New quick actions in the Table menu and in right-click ▸ Calculate / Text: New Column from Calculation (Price × Qty, or a column × 8% for tax), Add Totals Row, Fill Series, and text cleanup — trim spaces, change case, join or split columns.</li>
+                    <li>⌘D continues a pattern: 1, 2 carries on 3, 4, 5; Mon, Tue carries on Wed, Thu.</li>
+                    <li>Drag rows by their number to reorder them, or press ⌥⌘↑ / ⌥⌘↓. Row numbers now show by default.</li>
+                    <li>Keep Sorted Order makes a sort permanent. Sorting used to change only the view, so saving kept the original order.</li>
+                    <li>Ctrl-click opens the menu instead of dropping your selection, big totals no longer show as 1.23457e+06, and inserting or deleting a column no longer leaves the table sorted by the wrong column.</li>
                 </ul>
             ]]></description>
             <pubDate>${PUBDATE}</pubDate>
