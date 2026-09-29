@@ -122,9 +122,17 @@ nonisolated func numericValue(_ value: String) -> Double? {
         text = String(text.dropFirst().dropLast())
         parenthesisedNegative = true
     }
-    if let first = text.first, "$€£¥".contains(first) {
+    // "-$5.00" is how most exports write a negative amount, and it is how the
+    // grid's own quick actions write one, so the sign may come before the symbol.
+    var sign = ""
+    if let first = text.first, first == "-" || first == "+",
+       let second = text.dropFirst().first, "$€£¥".contains(second) {
+        sign = String(first)
+        text = String(text.dropFirst(2))
+    } else if let first = text.first, "$€£¥".contains(first) {
         text = String(text.dropFirst())
     }
+    text = sign + text
     if text.hasSuffix("%") { text = String(text.dropLast()) }
     text = text.replacingOccurrences(of: ",", with: "")
                .trimmingCharacters(in: .whitespaces)
